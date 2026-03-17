@@ -1,0 +1,661 @@
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out
+                                                          % if you need a4paper
+% \documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4
+                                                          % paper
+
+% \IEEEoverridecommandlockouts                              % This command is only
+                                                          % needed if you want to
+                                                          % use the \thanks command
+% \overrideIEEEmargins
+
+\input{preamble}
+
+
+\title{\LARGE \bf Dual Online Conformal Prediction for Uncertainty Quantification for  Learning with Applications to Safety-Critical Control
+}
+
+\crefname{definition}{Def.}{Defs.}
+
+\author{Daniel M. Cherenson and Dimitra Panagou
+\thanks{*Supported by }% <-this % stops a space
+\thanks{$^{1}$Department of Robotics,
+        University of Michigan, Ann Arbor, MI, USA
+        {\tt\small dmrc@umich.edu}}%
+\thanks{$^{2}$Department of Aerospace Engineering,
+        University of Michigan, Ann Arbor, MI, USA
+        {\tt\small dpanagou@umich.edu }}%
+}
+
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+    
+\end{abstract}
+
+\section{Outline}
+\begin{enumerate}
+    \item Introduction
+    \item Prelims
+    \item Problem Statement
+    \begin{itemize}
+        \item linear-in-parameter version of adaptive observer
+        \item nonlinear version
+    \end{itemize}
+    \item Method - Dual OCP
+    \item Safety-Critical Control
+    \begin{itemize}
+        \item CBFs
+        \item Robust MPC
+    \end{itemize}
+    \item Simulations
+    \item Conclusion
+
+\end{enumerate}
+
+\section{Introduction}
+
+Many safety-critical systems have model uncertainty and noisy measurements of a subset of all states, which makes it hard to guarantee safety. Many adaptive control and parameter estimation schemes have been developed that can handle output feedback and noisy measurements, and often assume that all unknown terms have known bounds, which are used in stability and convergence analysis. However, these bounds tend to be overly conservative and in practice, these bounds might not be known.
+
+For two classes of observers for systems with known dynamics, a robustifed CBF was developed in~\cite{agrawal2022safe}
+
+For linear-in-parameter uncertainty models, uncertainty quantification using zonotopes has been developed to construct a set in which the parameters are guaranteed to belong to~\cite{cohen2024uncertainty}. For robust MPC, L1 Adaptive control is used to quantify uncertainty~\cite{tao2024robust}.
+
+Recent work has used split conformal prediction to quantify the uncertainty of invertible sensor maps that predict the full state~\cite{yang2023safe,zhang2025conformal}, but these methods require gridding the state space and collecting large amounts of calibration data offline. Moreover, they assume that the full state is predicted through invertible sensor maps. In this paper, we consider a subset of the full state is available in measurements and corrupted with noise.
+
+Conformal prediction is a distribution-free, data-driven method of uncertainty quantification of prediction models that has been widely adopted in recent years. One shortcoming is that it typically requires that the data be exchangeable, which is hard to guaranteed in various robotics and controls settings, where incoming data is highly correlated in time and the distribution of the data may be shifting. Conformal prediction can be grouped into two versions: offline and online. The guarantees of offline are typically stronger, but require data to be collected offline. Offline versions such as weighted conformal prediction have been developed to alleviate assumptions on exchangeability, but the problem shifts to how to select the weights. UQ for learned dynamics to use in MPC was developed in~\cite{chee2023uncertainty} using weighted conformal prediction, selecting the weights to account for time correlation.
+
+On the other hand, online conformal prediction is a flexible option for systems that adapt and learn online, but comes with weaker guarantees. Online conformal prediction, also known as adaptive conformal prediction or adaptive conformal inference~\cite{gibbs2021adaptive, areces2025online} is a version of conformal prediction that can be used with non-exchangeable, streaming data, which often occurs in control systems. OCP has been used for for UQ of prediction models of dynamic obstacles or other agents~\cite{dixit2023adaptive, zhang2025safety}. 
+
+As conformal prediction is a data-driven method, it requires labeled data pairs of the form $(X_i, Y_i)$, where $X_i$ is the model input and $Y_i$ is the ground truth of the model output. Offline conformal prediction methods  assume access to the ground truth, which is generally a fair assumption. Depending on the application and prediction model, it may or may not be possible to receive truth data in an online setting. The works that have used OCP all assume they receive ground truth data one step after making a prediction. For example, in~\cite{dixit2023adaptive}, the prediction model makes a prediction of dynamic obstacle motion, and then at the next step perfectly measures the obstacle position. However, if the prediction model is predicting ego agent dynamics or estimating the state of the ego agent, the ground truth is never available (if it was, then there would be no need to use a prediction model). 
+
+In this paper, we develop two novel score functions that only use online-available or computable quantities and notably do \textit{not} require ground truth data. Using OCP, we can quantify the uncertainty of the dynamics prediction and state estimation which are used in two safety-critical controllers: CBFs and robust MPC.
+
+The contributions of this paper are as follows:
+\begin{itemize}
+    \item We develop a unified online uncertainty quantification architecture for safety-critical control of both linear and nonlinear-in-parameter nonlinear uncertainty systems using online conformal prediction with two novel score functions that quantify both state and parameter estimation uncertainty.
+    \item We show how to incorporate the UQ estimates into two common safety-critical control algorithms: robust CBFs and robust MPC
+    \item We show asymptotical empirical safety
+\end{itemize}
+
+
+\section{Preliminaries}
+
+% \begin{definition}
+% Adaptive conformal prediction is an online convex optimization framework designed to track a specified quantile of an unknown distribution over time. We define a conformity score $s_{k}$ at discrete time step $k$. The objective is to identify a dynamic threshold $q_{k}$ that bounds this score with a user-specified probability $1 - \alpha$. We achieve this by minimizing the pinball loss function, defined as $l_{k}(q) = (1-\alpha)\max(0, q - s_{k}) + \alpha\max(0, s_{k} - q)$. Applying online gradient descent to this loss provides a provably convergent threshold update mechanism.
+% \end{definition}
+
+% \begin{definition}
+% Concurrent learning is a parameter adaptation methodology that utilizes a history stack of recorded data to ensure parameter convergence. A history stack of $N$ data points is maintained, comprising regressors $Z_{i}$ and targets $Y_{i}$. A singular value maximization strategy governs stack admission, ensuring the minimum singular value of the accumulated regressor matrix remains strictly positive, which satisfies the finite excitation condition.
+% \end{definition}
+
+\section{Problem Formulation}
+
+Let the true nonlinear dynamical system be defined on the state space $x \in \mathbb{R}^n$, control input $u \in \mathcal{U} \subset \mathbb{R}^m$, and measured output $y \in \mathbb{R}^p$ subject to additive sensor noise $\epsilon(t) \in \mathbb{R}^p$. The continuous-time dynamics are governed by:
+\begin{align}
+\dot x(t) &= Ax(t) + f(x(t),u(t)) + \Delta(t,x(t),u(t))\label{eq:system}\\
+y(t) &= Cx(t) + \epsilon(t)
+\end{align}
+where $A \in \mathbb{R}^{n \times n}$ and $C \in \mathbb{R}^{p \times n}$ are known linear system matrices. The functions $\Phi: \mathbb{R}^n \times \mathbb{R}^m \to \mathbb{R}^n$, $\Phi: \mathbb{R}^n \to \mathbb{R}^{n \times q}$, and $g: \mathbb{R}^n \to \mathbb{R}^{n \times d}$ are known, continuously differentiable nominal dynamics. The vector $\theta^* \in \mathbb{R}^q$ represents unknown structured parameters, bounded by $\|\theta^*\|_2 \le \gamma_3$. The vector $\Delta(x,t) \in \mathbb{R}^d$ represents unknown, unstructured matched dynamics. We will drop the dependency on time in $x$, $y$, and $u$ when obvious.
+
+If there is prior data or information about the uncertainty $\Delta(t,x(t),u(t))$, it can be partitioned into a structured and unstructured part as \eqn{\Delta(t,x,u) = B\Phi(x,u)\theta^* + \delta(t,x,u),} where $B \in \R^{n\times s}$, $F : \R^n \times \R^n \to \R^{s \times p}$. The ideal parameter value $\theta^* \in \R^p$ depends on the quality of the approximation of the time-invariant portion of $\Delta(t,x,u)$ using $\Phi(x,u)\theta$. For example, $\Phi(x,u;w)$ can be a deep neural network parameterized by a set of weights $w \in \R^q$ that are fixed offline. For example, trained to minimize the loss \eqn{\theta^* = \arg \min_{\theta} \int_{\Xcal \times \Tcal} \|\Delta(t,x,u) - \Phi(x,u)\theta^*\|^2 \mathrm{d}x\mathrm{d}t}
+
+\begin{assumption}
+The nominal nonlinearities are globally Lipschitz with respect to $x$, such that $\|\Phi(x, u) - \Phi(\hat{x}, u)\| \le \gamma_1 \|x - \hat{x}\|$ and $\|\Phi(x) - \Phi(\hat{x})\| \le \gamma_2 \|x - \hat{x}\|$. The sensor noise is bounded by $\|\epsilon(t)\| \le \bar{\epsilon}$.
+\end{assumption}
+
+% \begin{assumption}
+% The unstructured disturbance is bounded in magnitude by $\sup_{x,t} \|\Delta(x,t)\| \le \bar{\Delta}$ and its temporal derivative is strictly bounded by $\|\dot{\Delta}(x,t)\| \le L_\Delta$. The matrix $g(x)$ satisfies $\sigma_{\min}(g(x)) \ge \underline{g} > 0 \quad \forall x \in \mathbb{R}^n$.
+% \end{assumption}
+
+
+
+To reconstruct the unmeasured states and learn $\theta^*$, an adaptive nonlinear observer is formulated. 
+
+The current estimate of $\theta^*$ is denoted $\hat\theta(t)$.
+
+\begin{definition}
+Let the state estimate be $\hat{x} \in \mathbb{R}^n$ and the parameter estimate be $\hat{\theta} \in \mathbb{R}^q$. The adaptive observer dynamics are defined as:
+\begin{equation}
+\dot{\hat{x}}(t) = A\hat{x}(t) + f(\hat{x}(t), u(t)) + \Phi(\hat{x}(t))\hat{\theta}(t) + L(y(t) - C\hat{x}(t))
+\end{equation}
+where $L \in \mathbb{R}^{n \times p}$ is the observer gain matrix. 
+\end{definition}
+
+Let $\tilde{x} = x - \hat{x}$ and $\tilde{\theta} = \theta^* - \hat{\theta}$. The state estimation error dynamics satisfy:
+\begin{align}
+\dot{\tilde{x}} &= (A-LC)\tilde{x} + \Phi(x,u) - \Phi(\hat{x},u) \nonumber \\
+&\quad + \Phi(x)\theta^* - \Phi(\hat{x})\hat{\theta} + g(x)\Delta(x,t) - L\epsilon(t)
+\end{align}
+
+An adaptive observer for the linear-in-parameter model~\eqref{eq:system} can be synthesized by solving an LMI~\cite{cho1997systematic, besanccon2000remarks}.
+
+If there exists a symmetric positive definite matrix $P \in \mathbb{R}^{n \times n}$ and a matrix $L \in \mathbb{R}^{n \times p}$ such that:
+\begin{equation}
+(A-LC)^T P + P(A-LC) + (\gamma_1 + \gamma_2 \gamma_3 \|I\|)PP + (\gamma_1 + \gamma_2 \gamma_3)I < 0
+\end{equation}
+with the structural constraint mapping $P \Phi(\hat{x}) = C^T W$ for some $W \in \mathbb{R}^{p \times q}$, then the unperturbed observer ($\Delta = 0, \epsilon=0$) is uniformly asymptotically stable.
+
+
+The parameter estimation scheme depends on a linear-in parameter model in the form $X(t) = Z(t)\theta^* + e(t)$. The available quantities are $\hat x(t), y(t)$, and $u(t)$, so the forms of $X(t)$ and $Z(t)$ must only be functions of those variables. Notably, $x(t)$ is not available because we do not assume full-state feedback.
+
+We begin by rearranging the dynamics equation \eqref{eq:system} as \eqn{\dot x - Ax - f(x,u) = B\Phi(x,u)\theta^* + \delta(t,x,u).}
+
+Since this expression contains terms that are unavailable to the controller ($\dot x$ and $x$), we integrate both sides of the equation from time $t-T$ to $t$, where $T$ is a moving horizon integration window \eqn{\int_{t-T}^t\dot x(\tau) - Ax(\tau) - f(x(\tau),u(\tau)) \mathrm{d}\tau = \\ \int_{t-T}^t B\Phi(x(\tau),u(\tau))\theta^* + \delta(\tau,x(\tau),u(\tau)) \mathrm{d}\tau.} 
+
+Evaluating the integral of $\dot x$ at its endpoints results in $x(t) - x(t-T)$. Now we add and subtract terms with $\hat x$ replacing $x$, and replace $x - \hat x$ with $\tilde x$: \eqn{&\underbrace{\hat x(t) - \hat x(t-T) - \int_{t-T}^t A\hat x(\tau) - f(\hat x(\tau),u(\tau)) \mathrm{d}\tau}_{X(t)}  \\ &= \underbrace{\bigg(\int_{t-T}^tB\Phi(\hat x(\tau), u(\tau)\mathrm{d}\tau\bigg)}_{Z(t)}\theta^* \underbrace{-(\tilde x(t) - \tilde x(t-T))}_{e(t)} \\ &\underbrace{+ \int_{t-T}^t A\tilde{x} + \tilde f + B\tilde \Phi\theta^* \mathrm{d}\tau + \int_{t-T}^t \delta(\tau, x(\tau), u(\tau)) \mathrm{d}\tau}_{e(t)}}
+
+the above equation defines the target $X(t) \in \mathbb{R}^n$ and regressor $Z(t) \in \mathbb{R}^{n \times q}$ that form a linear-in-parameter regression equation \eqn{X(t) = Z(t)\theta^* + e(t) \label{eq:reg}}
+
+\subsection{History Stack for Finite Excitation}
+
+Let $\mathcal{H} = \{(X_j, Z_j)\}_{j=1}^P$ be a history stack satisfying the persistent excitation condition $\lambda_{\min}(\sum_{j=1}^P Z_j^T Z_j) \ge \kappa > 0$ ~\cite{chowdhary2010concurrent}. Given $\Gamma = \Gamma^T > 0$ and $k_{cl} > 0$, the update law:
+\begin{equation}
+\dot{\hat{\theta}} = \Gamma \Bigg[ \Phi(\hat{x})^T C^T W (y - C\hat{x}) + k_{cl} \sum_{j=1}^P Z_j^T (X_j - Z_j\hat{\theta}) \Bigg]
+\end{equation}
+guarantees $\lim_{t \to \infty} \|\tilde{\theta}(t)\| = 0$ for the unperturbed system.
+Consider $V_\theta = \frac{1}{2}\tilde{\theta}^T \Gamma^{-1} \tilde{\theta}$. The LMI constraint $P\Phi(\hat{x}) = C^T W$ cancels the output injection cross-terms, yielding $\dot{V}_\theta \le -k_{cl} \kappa \|\tilde{\theta}\|^2 < 0$, establishing exponential parameter convergence.
+
+\subsection{Output-Feedback Deep Nonlinear Parameter Estimation}
+
+While full-state feedback adaptive controllers can often achieve asymptotic tracking by perfectly canceling nonlinear error dynamics, practical robotic deployments are strictly constrained to output-feedback via partial state measurements. Extending the deep neural network (DNN) adaptation from~\cite{he2025self} to output-feedback architectures introduces a fundamental structural challenge: the violation of the Strictly Positive Real (SPR) condition. In this section, we formalize the output-feedback DNN observer, detail the composite adaptation law, and rigorously demonstrate that the system achieves Uniform Ultimate Boundedness (UUB) by leveraging a $\sigma$-modification leakage term to overpower the un-canceled cross-dynamics.
+
+Let the true, partially observable system subject to complex unmodeled dynamics be defined as:
+\begin{align}
+    \dot{x}(t) &= A x(t) + f(x(t)) + g(x(t))u(t) + f_{nn}(x(t), \theta^*) + \delta(x, t) \\
+    y(t) &= C x(t) + \epsilon(t)
+\end{align}
+where $f_{nn}(x, \theta^*)$ represents a deep neural network parameterized by the optimal, unknown weights $\theta^*$. Because the true state $x(t)$ is inaccessible, we synthesize a nonlinear Luenberger-like state observer:
+\begin{equation}
+    \dot{\hat{x}}(t) = A \hat{x}(t) + f(\hat{x}(t)) + g(\hat{x}(t))u(t) + f_{nn}(\hat{x}(t), \hat{\theta}(t)) + L \big( y(t) - C\hat{x}(t) \big)
+\end{equation}
+where $\hat{\theta}(t)$ represents the real-time estimated network weights, and $L$ is a stabilizing observer gain such that the nominal error matrix $A_L = A - LC$ is strictly Hurwitz.
+
+Let $\tilde{x} = \hat{x} - x$ and $\tilde{\theta} = \hat{\theta} - \theta^*$ denote the state and parameter estimation errors, respectively. By invoking the first-order Taylor expansion, we approximate the neural network mismatch as $f_{nn}(\hat{x}, \hat{\theta}) - f_{nn}(x, \theta^*) = \hat{J}\tilde{\theta} + \Delta_{nn}$, where $\hat{J} = \frac{\partial f_{nn}(\hat{x}, \hat{\theta})}{\partial \hat{\theta}}$ is the Jacobian evaluated at the estimates, and $\Delta_{nn}$ encapsulates both the spatial substitution mismatch and the higher-order Taylor residual. The state error dynamics are thus:
+\begin{equation}
+    \dot{\tilde{x}}(t) = A_L \tilde{x}(t) + \hat{J}(t)\tilde{\theta}(t) + d_{obs}(t)
+\end{equation}
+where $d_{obs}(t) = \Delta_{nn} - \delta(x, t) + L\epsilon(t)$ represents the lumped, bounded observer disturbance.
+
+To analyze stability, we define the joint Lyapunov candidate function:
+\begin{equation}
+    V(\tilde{x}, \tilde{\theta}) = \tilde{x}^\top P \tilde{x} + \tilde{\theta}^\top \Gamma^{-1} \tilde{\theta}
+\end{equation}
+where $P = P^\top > 0$ satisfies the Lyapunov equation $A_L^\top P + P A_L = -Q$ for some $Q = Q^\top > 0$, and $\Gamma$ is a positive definite adaptation rate matrix. Taking the time derivative yields:
+\begin{equation}
+    \dot{V} = -\tilde{x}^\top Q \tilde{x} + 2\tilde{x}^\top P d_{obs} + 2\tilde{x}^\top P \hat{J} \tilde{\theta} + 2\tilde{\theta}^\top \Gamma^{-1} \dot{\hat{\theta}}
+\end{equation}
+
+In a standard adaptive control framework, the adaptation law $\dot{\hat{\theta}}$ must be designed to perfectly cancel the cross-term $2\tilde{x}^\top P \hat{J} \tilde{\theta}$. However, this requires computing $P\tilde{x}$, which is physically impossible as we only measure the output error $C\tilde{x}$. Perfect cancellation requires the existence of a matrix $P$ such that $P = C^\top C$ (the SPR condition). Because $C$ represents a partial measurement map with a non-trivial null space, the SPR condition is strictly violated. Consequently, the cross-term cannot be eliminated, presenting a severe destabilizing threat to the observer.
+
+\subsection{Robust Adaptation via $\sigma$-Modification}
+
+To prevent the un-canceled cross-term from driving the network parameters to infinity in the absence of Persistent Excitation (PE), we introduce a robust composite adaptation law featuring a $\sigma$-modification (leakage) term anchored to the pre-trained meta-learning weights $\theta_0$:
+\begin{equation}
+    \dot{\hat{\theta}}(t) = \Gamma \hat{J}(t)^\top C^\top \big( y(t) - C\hat{x}(t) \big) - \lambda \big( \hat{\theta}(t) - \theta_0 \big)
+\end{equation}
+where $\lambda > 0$ is the leakage gain. Furthermore, layer spectral normalization is continuously applied to structurally bound the Lipschitz constant of the network and uniformly bound the maximum norm of the Jacobian, $\|\hat{J}(t)\| \le \bar{J}$.
+
+\begin{theorem}[Uniform Ultimate Boundedness of the Output-Feedback DNN Observer]
+Consider the partially observable system (1)-(2) and the observer (3) driven by the adaptation law (8). Given that $\|\hat{J}\| \le \bar{J}$ and the lumped disturbance is bounded as $\|d_{obs}\| \le \bar{d}$, the state estimation error $\tilde{x}$ and parameter estimation error $\tilde{\theta}$ are Uniformly Ultimately Bounded (UUB).
+\end{theorem}
+\begin{proof}
+Substituting the adaptation law (8) into the Lyapunov derivative (7) and rewriting the measurement error as $y - C\hat{x} = -C\tilde{x} + \epsilon$ yields:
+\begin{align}
+    \dot{V} = &-\tilde{x}^\top Q \tilde{x} + 2\tilde{x}^\top P d_{obs} + 2\tilde{x}^\top P \hat{J} \tilde{\theta} \nonumber \\
+    &- 2\tilde{\theta}^\top \hat{J}^\top C^\top C \tilde{x} + 2\tilde{\theta}^\top \hat{J}^\top C^\top \epsilon - 2\lambda \tilde{\theta}^\top \Gamma^{-1} (\hat{\theta} - \theta_0)
+\end{align}
+Because $P \neq C^\top C$, the terms involving $\tilde{x}^\top P \hat{J} \tilde{\theta}$ and $\tilde{\theta}^\top \hat{J}^\top C^\top C \tilde{x}$ do not cancel. By applying the triangle inequality, the Cauchy-Schwarz inequality, and utilizing the completion of squares for the leakage term $-\lambda \tilde{\theta}^\top \Gamma^{-1} (\tilde{\theta} + \theta^* - \theta_0)$, we can bound the derivative:
+\begin{align}
+    \dot{V} \le &-\lambda_{\min}(Q) \|\tilde{x}\|^2 + 2 \|P\| \bar{d} \|\tilde{x}\| + 2 \|P - C^\top C\| \bar{J} \|\tilde{x}\| \|\tilde{\theta}\| \nonumber \\
+    &+ 2 \bar{J} \|C\| \bar{\epsilon} \|\tilde{\theta}\| - \lambda \lambda_{\min}(\Gamma^{-1}) \|\tilde{\theta}\|^2 + \lambda \lambda_{\max}(\Gamma^{-1}) \|\theta^* - \theta_0\|^2
+\end{align}
+To decouple the strictly indefinite cross-term $\|\tilde{x}\| \|\tilde{\theta}\|$, we apply Young's Inequality ($2ab \le \eta a^2 + \frac{1}{\eta} b^2$ for any $\eta > 0$):
+\begin{equation}
+    2 \|P - C^\top C\| \bar{J} \|\tilde{x}\| \|\tilde{\theta}\| \le \eta \|\tilde{x}\|^2 + \frac{\|P - C^\top C\|^2 \bar{J}^2}{\eta} \|\tilde{\theta}\|^2
+\end{equation}
+Substituting this bound back into (10) groups the quadratic terms:
+\begin{align}
+    \dot{V} \le &-\Big( \lambda_{\min}(Q) - \eta \Big) \|\tilde{x}\|^2 + 2 \|P\| \bar{d} \|\tilde{x}\| \nonumber \\
+    &-\Big( \lambda \lambda_{\min}(\Gamma^{-1}) - \frac{\|P - C^\top C\|^2 \bar{J}^2}{\eta} \Big) \|\tilde{\theta}\|^2 + 2 \bar{J} \|C\| \bar{\epsilon} \|\tilde{\theta}\| \nonumber \\
+    &+ \lambda \lambda_{\max}(\Gamma^{-1}) \|\theta^* - \theta_0\|^2
+\end{align}
+For $\dot{V}$ to be strictly negative definite outside a compact region, the coefficients of the quadratic error terms must be strictly positive. We choose $\eta < \lambda_{\min}(Q)$, and we select the leakage gain $\lambda$ such that:
+\begin{equation}
+    \lambda > \frac{\|P - C^\top C\|^2 \bar{J}^2}{\eta \lambda_{\min}(\Gamma^{-1})}
+\end{equation}
+Consequently, the quadratic penalty generated by the $\sigma$-modification overpowering the leakage term dominates the un-canceled linear cross-terms for large $\|\tilde{\theta}\|$. Therefore, $\dot{V} < 0$ whenever $\|\tilde{x}\|$ or $\|\tilde{\theta}\|$ exceeds a finite threshold, mathematically guaranteeing that the tracking and parameter errors are Uniformly Ultimately Bounded (UUB) within a definitive error ball.
+\end{proof}
+
+\subsection{Problem Statement}
+
+\begin{problem}
+For both the linear- and nonlinear-in-parameter uncertain output-feedback systems, design an online uncertainty quantification module to estimate terms relating to parameter uncertainty $\tilde \theta$ and state estimation uncertainty $\tilde x$ and use them to robustify safety-critical control algorithms.
+\end{problem}
+
+
+\section{Data-Driven Robust Safety via Dual Online Conformal Prediction}
+\begin{figure}
+    \centering
+    \includegraphics[width=1\linewidth]{blkdiag.png}
+    \caption{Placeholder Block Diagram}
+    \label{fig:blkdiag}
+\end{figure}
+
+Classical robust control architectures heavily rely on static, a priori worst-case bounds for parameter estimation errors and unstructured disturbances. Such assumptions inevitably yield highly conservative safety margins. To overcome this, we introduce a Dual Online Conformal Prediction (DOCP) framework. By simultaneously bounding the instantaneous measurement residual and the moving-horizon state drift, we construct a dynamic, data-driven envelope that captures both high-frequency observable noise and low-frequency unmeasured phase delays. This envelope is then integrated directly into both Control Barrier Function (CBF) and Model Predictive Control (MPC) synthesis.
+
+\subsection{Dual-Conformal Uncertainty Bounding}
+Let $k \in \N$ be a discrete index of sampling times when OCP is run, with each step $k$ corresponding to time $t_k$.
+We define the non-conformity score $S_k \in \R$ at time $t_k$ as the current error in the regression equation \eqref{eq:reg} using the current value of the estimated parameters $\hat \theta$: \eqn{S_k = \|X(t_k) - Z(t_k)\hat{\theta}(t_k)\| \label{eq:score}.} Note that computing $S_k$ requires $\hat x(t_k), \hat x(t_k-T), u(t_k), u(t_k-T)$ and $\hat \theta(t_k)$ which are all available in the controller. Given a user-specified mis-coverage rate $\alpha \in (0,1)$ and (decreasing) step size $\eta_k = \mathcal{O}(1/\sqrt{k})$, OCP runs online gradient descent of the pinball loss to update the estimated quantile $q_k \in \mathbb{R}_{\ge 0}$. The update equation is
+\begin{equation}
+q_{k+1} = \max\Big(0, q_k + \eta_k (\mathbbm{1}\{s_k > q_k\} - \alpha)\Big)
+\end{equation}
+
+\begin{theorem}[Asymptotic Empirical Coverage]
+
+\begin{equation}
+\lim_{K \to \infty} \frac{1}{K} \sum_{k=1}^K \mathbbm{1}\{S_k \le q_k\} = 1 - \alpha
+\end{equation}
+\end{theorem}
+\begin{proof}
+
+\end{proof}
+
+Recall the parameter error $\tilde \theta(t_k) = \theta^* - \hat 
+\theta(t_k)$. We rewrite $S_k$ to make the uncertain terms appear to solve the uncertainty quantification problem \eqn{S_k = \|X(t_k) - Z(t_k)\hat{\theta}(t_k)\| = \|Z(t_k)\tilde \theta(t_k) + e(t_k)\|}
+
+
+Let the state space be partitioned into measured and unmeasured components, such that $x = [x_m^\top, x_u^\top]^\top \in \mathbb{R}^{n_m} \times \mathbb{R}^{n_u}$, with $n_m + n_u = n$. The observer output injection relies on the measurement model $y(t_k) = C x(t_k) + \epsilon(t_k)$, where $C$ has rank $n_m$ and $\|\epsilon(t_k)\| \le \bar{\epsilon}$ is a known strict bound on the sensor noise.
+
+\begin{definition}[Output Conformal Quantile]
+Let $S^y_k = \|y(t_k) - C\hat{x}(t_k)\|$ denote the instantaneous output conformity score. For a user-defined error rate $\alpha \in (0,1)$, the online gradient descent update yields a dynamic threshold $q^y_k \in \mathbb{R}_{\ge 0}$ such that $S^y_k \le q^y_k$ holds with asymptotic probability $1-\alpha$.
+\end{definition}
+
+\begin{lemma}[Measured State Error Bound]
+Given the condition $S^y_k \le q^y_k$, the instantaneous state estimation error of the measured subspace, $\tilde{x}_m(t_k) = x_m(t_k) - \hat{x}_m(t_k)$, is strictly bounded by:
+\begin{equation}
+    \|\tilde{x}_m(t_k)\| \le \frac{1}{\sigma_{\min}(C_m)} \left( q^y_k + \bar{\epsilon} \right) := \bar{x}_{m,k}
+\end{equation}
+where $C_m \in \mathbb{R}^{p \times n_m}$ is the full-column-rank partition of the measurement matrix corresponding to the observable states.
+\end{lemma}
+\begin{proof}
+By definition, $S^y_k = \|C_m \tilde{x}_m(t_k) + \epsilon(t_k)\|$. Applying the reverse triangle inequality yields $\|C_m \tilde{x}_m(t_k)\| - \|\epsilon(t_k)\| \le q^y_k$. Substituting the uniform noise bound $\|\epsilon(t_k)\| \le \bar{\epsilon}$ and projecting through the minimum singular value of $C_m$ isolates the measured state error magnitude, yielding the bound $\bar{x}_{m,k}$.
+\end{proof}
+
+Crucially, the unmeasured state error $\tilde{x}_u(t_k)$ resides entirely within the null space of $C$, rendering it physically invisible to the instantaneous metric $S^y_k$. To capture the hidden momentum of disturbances acting on the unmeasured states, we invoke the moving-horizon state-space integral score $S_k$, bounded by the threshold $q_k$. 
+
+\begin{lemma}[Unmeasured State and Disturbance Envelope]
+Let the unmeasured state boundary error and the integrated lumped disturbance over the horizon $T$ be governed by the state-space conformal threshold $q_k$. The unmeasured state error is empirically bounded by $\|\tilde{x}_u(t_k)\| \le \bar{x}_{u,k} := q_k$, and the effective instantaneous unmodeled dynamics are bounded by $\|\mathcal{E}(t_k)\| \le \bar{\mathcal{E}}_k := q_k / T$.
+\end{lemma}
+
+\subsection{Dynamic Quantile Update for Deep Adaptive System}
+
+The efficacy of the Dual-Conformal safety filter relies entirely on the continuous, real-time evaluation of the nonconformity measures (scores) $S^y_k$ and $S_k$. These scores serve as the empirical proxy for the uncomputable true estimation errors, dynamically inflating the spatial envelope $\Omega_k$ when the deep neural network (DNN) encounters out-of-distribution (OOD) dynamics, and collapsing it when the composite adaptation law successfully converges to the UUB error ball.
+
+\subsection{Empirical Computation of the Dual-Conformal Scores}
+
+The efficacy of the Dual-Conformal safety filter relies on the continuous, real-time evaluation of the nonconformity measures (scores) $S^y_k$ and $S_k$. These scores serve as the empirical proxies for the uncomputable true estimation errors, dynamically inflating the spatial envelope $\Omega_k$ when the deep neural network (DNN) encounters out-of-distribution dynamics, and collapsing it when the composite adaptation law successfully converges.
+
+\subsubsection{Instantaneous Output Score ($S^y_k$)}
+
+The measured state error is bounded by the instantaneous output nonconformity measure. At any discrete time step $t_k$, this score evaluates the geometric magnitude of the real-time measurement innovation:
+\begin{equation}
+    S^y_k = \left\| y(t_k) - C\hat{x}(t_k) \right\|
+\end{equation}
+Because the output projection $C$ isolates the measured subspace, $S^y_k$ provides a high-frequency, instantaneous metric of the DNN's approximation error along the observable axes, fully independent of temporal integration delays.
+
+\subsubsection{Moving-Horizon State Integral Score ($S_k$)}
+
+To bound the unmeasured states residing in the null space of the measurement matrix $C$, we must capture the "hidden momentum" of the system over a temporal window $T$. We define this measure by evaluating the exact divergence between the observer's realized trajectory and its nominal, open-loop prediction.
+
+Let the computable nominal drift of the observer, which relies entirely on the known physics and the current estimated DNN weights $\hat{\theta}$, be defined as:
+\begin{equation}
+    \dot{\hat{x}}_{nom}(\tau) = A\hat{x}(\tau) + f(\hat{x}(\tau)) + g(\hat{x}(\tau))u(\tau) + f_{nn}(\hat{x}(\tau), \hat{\theta}(\tau))
+\end{equation}
+
+If the neural network perfectly captured the unmodeled dynamics and the state estimate was exact, the integration of $\dot{\hat{x}}_{nom}$ would perfectly map the state $\hat{x}(t_k-T)$ to $\hat{x}(t_k)$. Any deviation from this path represents the lumped, unmodeled physical disturbance acting on the system over the window $T$. 
+
+We define the moving-horizon state-space nonconformity score precisely as this geometric discrepancy:
+\eqn{
+    S_k = \|& \hat{x}(t_k) - \hat{x}(t_k-T) \\ &- \int_{t_k-T}^{t_k} \Big( A\hat{x}(\tau) + f(\hat{x}(\tau)) + g(\hat{x}(\tau))u(\tau) + f_{nn}(\hat{x}(\tau), \hat{\theta}(\tau)) \Big) \mathrm{d}\tau \|
+}
+
+Computationally, from the observer dynamics $\dot{\hat{x}} = \dot{\hat{x}}_{nom} + L(y - C\hat{x})$, it is trivial to show that the entirety of Equation (16) algebraically simplifies to the integral of the output injection term: $\left\| \int_{t_k-T}^{t_k} L(y(\tau) - C\hat{x}(\tau)) \mathrm{d}\tau \right\|$. However, expressing $S_k$ in the form of Equation (16) explicitly demonstrates its role in bounding the trajectory-level prediction error generated by the overparameterized neural network.
+
+
+
+\subsubsection{Dynamic Quantile Update}
+
+With the empirical scores $S^y_k$ and $S_k$ strictly defined and computable, the adaptive conformal quantiles $q^y_k$ and $q_k$ are updated at each time step to satisfy the target miscoverage rate $\alpha \in (0,1)$. Using an online gradient descent formulation, the bounds evolve according to the step-size learning rate $\eta_q > 0$:
+\begin{align}
+    q^y_{k+1} &= q^y_k + \eta_q \Big( \mathbb{I} \{ S^y_k > q^y_k \} -\alpha\Big) \\
+    q_{k+1} &= q_k + \eta_q \Big(\mathbb{I} \{ S_k > q_k \} -\alpha \Big)
+\end{align}
+where $\mathbb{I}\{\cdot\}$ is the indicator function. This closed-loop quantification ensures the geometric safety margins expand dynamically to protect the physical system from DNN approximation residuals.
+
+This formulation yields a fully closed-loop uncertainty quantification mechanism. If the DNN adaptation law is perturbed by severe unmodeled aerodynamics, the injection integral inflates, $S_k$ exceeds $q_k$, the indicator function evaluates to zero, and $q_{k+1}$ scales upward. This ensures the geometric safety margins in both the Control Barrier Function and the Tube MPC expand dynamically to protect the physical system.
+
+\subsection{Data-Driven Control Barrier Functions (CBF)}
+
+We now project the dual-conformal bounds into the geometric space of a Control Barrier Function, $h(x)$, rendering the true safe set $\mathcal{S} = \{x \in \mathbb{R}^n : h(x) \ge 0\}$ forward invariant without assuming explicit bounds on the parameter mismatch $\tilde{\theta}$ or the disturbance $\Delta(x,t)$.
+
+
+
+\begin{theorem}[Dual-Conformal CBF Constraint]
+Let the gradient of the barrier function evaluated at the estimate be partitioned as $\nabla h(\hat{x}) = [\nabla_m h(\hat{x}), \nabla_u h(\hat{x})]$. Let $L_{\nabla m}$ and $L_{\nabla u}$ be the respective local Lipschitz constants of these gradient partitions. If the control input $u \in \mathcal{U}$ satisfies the computable inequality:
+\begin{equation}
+    L_g h(\hat{x}) u \ge -\lambda h(\hat{x}) - \nabla h(\hat{x})\dot{\hat{x}}_{drift} + \mathcal{M}(q^y_k, q_k, u)
+\end{equation}
+where the dynamic, data-driven margin is defined as:
+\begin{align}
+    \mathcal{M}(q^y_k, q_k, u) = \Big( &\|\nabla h(\hat{x})\| + L_{\nabla m}\bar{x}_{m,k} + L_{\nabla u}\bar{x}_{u,k} \Big)\bar{\mathcal{E}}_k \nonumber \\
+    &+ \Big( L_{\nabla m}\bar{x}_{m,k} + L_{\nabla u}\bar{x}_{u,k} \Big) \|\dot{\hat{x}}_{drift} + g(\hat{x})u\| \nonumber \\
+    &+ \lambda L_h \Big( \bar{x}_{m,k} + \bar{x}_{u,k} \Big)
+\end{align}
+then the true state $x(t)$ satisfies $\dot{h}(x) \ge -\lambda h(x)$, guaranteeing the safety of the partially observable system.
+\end{theorem}
+\begin{proof}
+The true physical derivative is $\dot{x}(t) = \dot{\hat{x}}_{drift}(t) + g(\hat{x})u(t) + \mathcal{E}(t)$. Evaluating the true safety constraint $\nabla h(x)\dot{x} + \lambda h(x) \ge 0$ at the estimated state $\hat{x}$ introduces the spatial mismatches $(\nabla h(x) - \nabla h(\hat{x}))\dot{x}_{nom}$ and $(\nabla h(x) - \nabla h(\hat{x}))\mathcal{E}(t)$. By decoupling the state estimation error into measured and unmeasured components, we apply the Cauchy-Schwarz inequality independently to each partition. Substituting the conformal bounds $\bar{x}_{m,k}$ (from Lemma 1) and $\bar{x}_{u,k}, \bar{\mathcal{E}}_k$ (from Lemma 2) bounds the absolute worst-case negativity of the uncomputable terms. Rearranging to isolate $u$ yields the stated margin.
+\end{proof}
+
+\subsection{Dual-Conformal Tube Model Predictive Control}
+
+While the CBF enforces instantaneous safety, the pointwise nature of the Lipschitz bounds can induce conservatism. By lifting the dual-conformal architecture into a Robust Tube MPC (RT-MPC) framework, we handle the safety geometrically over a predictive horizon, allowing the robust margins to dynamically "breathe" with the quality of the online data.
+
+
+
+Let $z$ denote the virtual nominal state and $v$ denote the virtual nominal control input, governed by the estimated physics $\dot{z} = A z + f(z) + g(z)v + \phi(z)\hat{\theta}_k$. The true state is tethered to the virtual state via a local stabilizing ancillary gain $K$, such that $u = v + K(\hat{x} - z)$.
+
+\begin{definition}[Dynamic Conformal Tube Propagation]
+At time step $t_k$, we define the initial spatial uncertainty set as the Minkowski sum of the measured and unmeasured estimation error bounds:
+\begin{equation}
+    \mathcal{E}_x(q^y_k, q_k) = \{ e \in \mathbb{R}^n : \|e_m\| \le \bar{x}_{m,k}, \; \|e_u\| \le \bar{x}_{u,k} \}
+\end{equation}
+Let $\mathcal{W}(q_k) = \{ w \in \mathbb{R}^n : \|w\| \le \bar{\mathcal{E}}_k \}$ define the instantaneous data-driven disturbance set. The conformal tube cross-section at predictive step $j \in [0, H]$ is dynamically generated via:
+\begin{equation}
+    \Omega_{j|k} = (A_{cl})^j \left( \mathcal{E}_x(q^y_k, q_k) \oplus \{ \hat{x}_k - z_k \} \right) \oplus \bigoplus_{i=0}^{j-1} (A_{cl})^i \mathcal{W}(q_k)
+\end{equation}
+where $A_{cl}$ is the closed-loop nominal system matrix under the ancillary gain $K$.
+\end{definition}
+
+By substituting the offline, static Robust Positively Invariant (RPI) sets of classical Tube MPC with our online, data-driven sets $\Omega_{j|k}$, the Optimal Control Problem (OCP) adapts the stringency of its safety constraints in real time.
+
+\begin{theorem}[Dual-Conformal RT-MPC Optimization]
+Given the physical safety constraints $x \in \Scal$ and $u \in \mathcal{U}_{safe}$, the Dual-Conformal RT-MPC computes the optimal nominal control sequence $v^*_{0\dots H-1}$ by solving:
+\begin{align}
+    \min_{v_{0\dots H-1}} \quad & \sum_{j=0}^{H-1} \Big( \|z_{j|k} - x_{ref}\|^2_Q + \|v_{j|k}\|^2_R \Big) + \|z_{H|k} - x_{ref}\|^2_{P_f} \\
+    \text{s.t.} \quad & z_{0|k} = z(t_k) \nonumber \\
+    & z_{j+1|k} = A z_{j|k} + f(z_{j|k}) + g(z_{j|k})v_{j|k} + \phi(z_{j|k})\hat{\theta}_k \nonumber \\
+    & z_{j|k} \in \Scal \ominus \Omega_{j|k}(q^y_k, q_k) \label{eq:state_tighten} \\
+    & v_{j|k} \in \mathcal{U}_{safe} \ominus K \Omega_{j|k}(q^y_k, q_k) \label{eq:input_tighten}
+\end{align}
+where $\ominus$ denotes the Pontryagin difference. 
+\end{theorem}
+
+% This architecture ensures that if the adaptive observer converges and environmental disturbances are negligible, $q^y_k \to 0$ and $q_k \to 0$. Consequently, the tube $\Omega_{j|k}$ collapses, and constraints \eqref{eq:state_tighten} and \eqref{eq:input_tighten} converge to the true physical boundaries, recovering nominal performance. Conversely, in the presence of severe unmodeled dynamics, the quantiles inflate, and the MPC automatically tightens its virtual boundaries to secure the system against the expanding uncertainty envelope.
+
+% \section{Robust Adaptive Safety Filter}
+
+% \begin{definition}
+% A set $\mathcal{S} = \{x \in \mathbb{R}^n : h(x) \ge 0\}$ is rendered strictly forward invariant if $\exists \gamma \in \mathcal{K}_\infty$ such that the control input satisfies $\dot{h}(x) \ge -\gamma(h(x))$ for all $x \in \mathcal{S}$. 
+% \end{definition}
+
+% \begin{lemma}[Observer Substitution Mismatch]
+% Let $\dot{h}(\hat{x}) = L_A h(\hat{x}) + L_\Phi h(\hat{x}) + L_g h(\hat{x})u + L_\Phi h(\hat{x})\hat{\theta}$. The discrepancy between the true and estimated Lie derivatives is bounded by $|\dot{h}(x) - \dot{h}(\hat{x}) - L_g h(x)\Delta(x)| \le L_{CBF} \bar{x}_{err}$, where $L_{CBF}$ is the composite Lipschitz constant of the barrier gradients.
+% \end{lemma}
+
+% \begin{definition}[Robust CBF-QP]
+% Let $u_{des} \in \mathbb{R}^m$ be a nominal control law. The robust adaptive safety filter is the solution to the convex quadratic program:
+% \begin{align}
+% u^* = \arg\min_{u \in \mathcal{U}} \quad & \frac{1}{2} \|u - u_{des}\|^2 \nonumber \\
+% \text{s.t.} \quad & L_g h(\hat{x}) u \ge -\gamma(h(\hat{x})) - L_A h(\hat{x}) - L_\Phi h(\hat{x}) - L_\Phi h(\hat{x})\hat{\theta} \nonumber \\
+% & + B_q(t) \|L_g h(\hat{x})\| + L_{CBF} \bar{x}_{err}
+% \end{align}
+% \end{definition}
+
+% \begin{theorem}[Asymptotic Empirical Safety]
+% Let $\mathcal{T}_{safe}(K) = \sum_{k=1}^K \mathbbm{1}\{\dot{h}(x(t_k)) \ge -\gamma(h(x(t_k)))\}$. If the QP in Definition 5 remains continuously feasible, the empirical rate of safety satisfies:
+% \begin{equation}
+% \lim_{K \to \infty} \frac{1}{K} \mathcal{T}_{safe}(K) \ge 1 - \alpha
+% \end{equation}
+% \end{theorem}
+% \begin{proof}
+% Substitution of $u^*$ into $\dot{h}(x)$ yields $\dot{h}(x) \ge -\gamma(h(\hat{x})) + B_q(t_k)\|L_g h(\hat{x})\| + L_g h(x)\Delta(x) + L_{CBF}\bar{x}_{err} + \text{Error}_{sub}$. By Lemma 4, $L_{CBF}\bar{x}_{err} + \text{Error}_{sub} \ge 0$. The inner product is geometrically bounded by $L_g h(x)\Delta \ge -\|L_g h(x)\| \|\Delta\|$. By Lemma 3, the condition $s_k \le q_k$ implies $\|\Delta(x(t_k))\| \le B_q(t_k)$. Therefore, $\mathbbm{1}\{s_k \le q_k\} \implies \mathbbm{1}\{\|\Delta\| \le B_q\} \implies \mathbbm{1}\{\dot{h}(x) \ge -\gamma(h(x))\}$. Applying Theorem 3 to the indicator inequalities establishes the strict lower bound $1-\alpha$ on the asymptotic empirical safety rate.
+% \end{proof}
+
+
+% \section{Problem Statement}
+
+% Consider an uncertain nonlinear dynamical system described by the state and output equations
+
+
+% $$\dot{x} = f(x) + g(x)u + \Phi(x)\theta^{*} + \delta(x)$$
+
+% $$y = Cx + \epsilon$$
+
+
+% where $x \in \mathbb{R}^{n}$ is the unmeasured state vector, $u \in \mathbb{R}^{m}$ is the control input vector, and $y \in \mathbb{R}^{p}$ is the measured output vector. The terms $f(x)$ and $g(x)$ represent the known nominal system dynamics. The matrix $C \in \mathbb{R}^{p \times n}$ is a known output matrix. The measurement noise is denoted by $\epsilon$. The structured unknown dynamics are parameterized by a known feature matrix $\Phi(x)$ and an unknown constant ideal parameter vector $\theta^{*}$. The unstructured modeling error is represented by $\delta(x)$.
+
+% \begin{assumption}
+% The nominal dynamics $f(x)$ and $g(x)$, and the feature matrix $\Phi(x)$, are globally Lipschitz continuous on $\mathbb{R}^{n}$.
+% \end{assumption}
+
+% \begin{assumption}
+% There exists an observer gain matrix $L$ and a symmetric positive definite matrix $P$ such that $A_{L} = \frac{\partial f}{\partial x} - LC$ satisfies the Lyapunov equation $A_{L}^{T} P + P A_{L} = -Q$ for some symmetric positive definite matrix $Q$. Furthermore, there exists an output injection matrix $M$ such that the strictly positive real condition $P = C^{T} M^{T}$ is satisfied.
+% \end{assumption}
+
+% \begin{assumption}
+% The ideal parameters, unstructured modeling error, and measurement noise are bounded by known constants such that $\|\theta^{*}\| \leq \theta_{\max}$, $\|\delta(x)\| \leq \bar{\delta}$, and $\|\epsilon\| \leq \bar{\epsilon}$. Furthermore, the system satisfies the matched uncertainty condition, implying there exists a mapping $\Delta(x)$ such that $\delta(x) = g(x)\Delta(x)$.
+% \end{assumption}
+
+% The control objective is to synthesize an output-feedback control law $u$ that forces the unmeasured state to track a continuously differentiable reference trajectory $x_{r}$ while strictly confining the system to a predefined safe set, concurrently estimating the unmeasured states, identifying the unknown parameters $\theta^{*}$, and dynamically bounding the integrated unstructured modeling error to ensure mathematically rigorous safety margins.
+
+% \section{Method}
+
+% To reconstruct the unmeasured states, we synthesize a Luenberger-type adaptive observer with state estimate $\hat{x}$ and parameter estimate $\hat{\theta}$. The observer dynamics are defined as
+
+
+% $$\dot{\hat{x}} = f(\hat{x}) + g(\hat{x})u + \Phi(\hat{x})\hat{\theta} + L(y - C\hat{x})$$
+
+
+% We define the state estimation error as $\tilde{x} = x - \hat{x}$ and the output estimation error as $\tilde{y} = y - C\hat{x}$.
+
+% Because the concurrent learning regressor inherently depends on the unmeasured state derivative, we project the system dynamics into an observable surrogate using a moving-horizon integral. Integrating the true time derivative of the noisy output measurement over the receding finite time window from $t-T$ to $t$ yields
+
+
+% $$y(t) - y(t-T) = \int_{t-T}^{t} C(f(x) + g(x)u + \Phi(x)\theta^{*} + \delta(x)) d\tau + \epsilon(t) - \epsilon(t-T)$$
+
+
+% To isolate the computable components from the observer substitution error, we evaluate the known functions using the observer state estimate $\hat{x}$. We define the fixed-time computable target vector $Y(t)$ and the fixed-time regressor matrix $Z(t)$ as
+
+
+% $$Y(t) = y(t) - y(t-T) - \int_{t-T}^{t} C(f(\hat{x}) + g(\hat{x})u) d\tau$$
+
+% $$Z(t) = \int_{t-T}^{t} C\Phi(\hat{x}) d\tau$$
+
+
+% Equating these definitions with the true integrated dynamics yields the exact fixed-time linear regression model
+
+
+% $$Y(t) = Z(t)\theta^{*} + e_{total}(t)$$
+
+
+% The lumped residual $e_{total}(t)$ is exactly evaluated as the superposition of the integrated substitution error, the integrated unstructured disturbance, and the discrete boundary noise difference
+
+
+% $$e_{total}(t) = \int_{t-T}^{t} C \Big( f(x) - f(\hat{x}) + (g(x) - g(\hat{x}))u + (\Phi(x) - \Phi(\hat{x}))\theta^{*} \Big) d\tau + \int_{t-T}^{t} C\delta(x) d\tau + \epsilon(t) - \epsilon(t-T)$$
+
+% \begin{lemma}
+% The moving-horizon integral mapping guarantees that the observable surrogate variables converge to the exact system relations in fixed time $T$, entirely free of asymptotic initial-condition transients. Consequently, the lumped residual $e_{total}(t)$ represents the exact bounded integration of the true physical unmodeled dynamics and bounded measurement noise over the receding horizon.
+% \end{lemma}
+
+% \begin{proof}
+% The moving-horizon integration operator maps the continuous-time derivative to an exact algebraic difference over the interval. For all time $t \geq T$, the integration domain strictly excludes the system initial time, thereby isolating the mapping from unforced homogeneous responses characteristic of infinite impulse response filters. Because the integrands $f, g,$ and $\Phi$ are globally Lipschitz continuous, the substitution error vanishes precisely as the observer converges. Furthermore, the noise derivative is evaluated purely at the interval boundaries via the fundamental theorem of calculus, strictly bounding the noise contribution by $2\bar{\epsilon}$ and preventing spectral amplification. Therefore, the relation $Y(t) - Z(t)\theta^{*} = e_{total}(t)$ constitutes an exact algebraic truth representing the true integrated uncertainty.
+% \end{proof}
+
+% We maintain a history stack of $N$ data points $(Z_{i}, Y_{i})$. To ensure optimal transient performance and exponential convergence, we utilize a continuous-time recursive least squares formulation. The parameter update law is driven by both the instantaneous output estimation error and the historical prediction error, scaled by a time-varying covariance matrix $\Gamma(t)$
+
+
+% $$\dot{\hat{\theta}} = \Gamma(t) \left( \Phi(\hat{x})^{T} M \tilde{y} + \sum_{i=1}^{N} Z_{i}^{T} (Y_{i} - Z_{i} \hat{\theta}) \right)$$
+
+
+% The evolution of the covariance matrix is governed by a continuous-time matrix Riccati equation incorporating a forgetting factor $\beta > 0$. Defining the strictly positive definite history stack matrix as $\Omega = \sum_{i=1}^{N} Z_{i}^{T} Z_{i}$, the covariance update is given by
+
+
+% $$\dot{\Gamma}(t) = \beta \Gamma(t) - \Gamma(t) \Omega \Gamma(t)$$
+
+% We apply adaptive conformal prediction directly to the fixed-time concurrent learning residuals. We define the conformity score at discrete time step $k$ as the Euclidean norm of the integrated estimation error
+
+
+% $$s_{k} = \|Y(t_{k}) - Z(t_{k})\hat{\theta}_{k}\| = \|Z(t_{k})\tilde{\theta}_{k} + e_{total}(t_{k})\|$$
+
+
+% We introduce a dynamic scalar threshold $q_{k}$ and update it via online gradient descent on the pinball loss
+
+
+% $$q_{k+1} = \max(0, q_{k} + \eta_{k} (\alpha - I\{s_{k} \leq q_{k}\}))$$
+
+
+% where $\eta_{k}$ is a monotonically decreasing step size and $I$ is the standard indicator function.
+
+% To guarantee safety, we integrate the adaptive components into a robust control barrier function safety filter. We first synthesize an unconstrained desired control law $u_{des}$ comprising a feedback linearization term and an adaptive cancellation term
+
+
+% $$u_{des} = g(\hat{x})^{+} ( -f(\hat{x}) + \dot{x}_{r} - K e ) - \Phi(\hat{x})\hat{\theta}$$
+
+
+% where $e = \hat{x} - x_{r}$ is the tracking error and $K$ is a positive definite gain matrix.
+
+% We formulate the safety filter as a quadratic program that minimally perturbs $u_{des}$ to satisfy a dynamically tightened barrier constraint informed by the continuous conformal threshold $q(t)$. The applied control $u$ is the solution to minimizing $\frac{1}{2} \|u - u_{des}\|^{2}$ subject to the inequality constraint
+
+
+% $$L_{g} h(\hat{x}) u \geq -\gamma(h(\hat{x})) - L_{f} h(\hat{x}) - L_{\Phi} h(\hat{x})\hat{\theta} - \frac{\partial h}{\partial \hat{x}} L \tilde{y} + c_{safe} q(t) \|L_{g} h(\hat{x})\|$$
+
+
+% where $\gamma$ is a strictly extended class kappa function, $L_{f}, L_{g},$ and $L_{\Phi}$ denote the Lie derivatives along the respective vector fields, and $c_{safe}$ is a strictly positive scaling constant.
+
+% \begin{algorithm}
+% \caption{Output-Feedback Adaptive Safe Control with Moving-Horizon Concurrent Learning}
+% \label{alg:main_algorithm}
+% \KwData{Measured output $y(t)$, reference trajectory $x_{r}(t)$, safe set function $h$}
+% \KwData{Nominal gain $K$, observer gain $L$, filter window $T$, scaling $c_{safe}$}
+% \KwData{Target miscoverage rate $\alpha$, step size sequence $\eta_{k}$, forgetting factor $\beta$}
+% Initialize observer state $\hat{x}(0)$, parameter estimates $\hat{\theta}(0)$, and covariance $\Gamma(0) > 0$;
+% Initialize conformal threshold $q_{0} > 0$ and history stack $H = \emptyset$;
+% \For{continuous time $t \geq 0$}{
+% Compute unconstrained desired control $u_{des} = g(\hat{x})^{+} ( -f(\hat{x}) + \dot{x}_{r} - K e ) - \Phi(\hat{x})\hat{\theta}$;
+% Solve quadratic program for applied control $u$ subject to barrier constraint with robust margin $c_{safe} q(t) \|L_{g} h(\hat{x})\|$;
+% Apply control input $u$ to the system;
+% Measure system output $y(t)$;
+% Update observer state $\dot{\hat{x}} = f(\hat{x}) + g(\hat{x})u + \Phi(\hat{x})\hat{\theta} + L(y - C\hat{x})$;
+% \If{$t \geq T$}{
+% Compute moving-horizon target $Y(t)$ and regressor $Z(t)$ over integration window $[t-T, t]$;
+% \If{new data $(Z(t), Y(t))$ increases minimum singular value of stack $H$}{
+% Replace least informative point in stack $H$ with $(Z(t), Y(t))$;
+% }
+% }
+% Update covariance $\dot{\Gamma}(t) = \beta \Gamma(t) - \Gamma(t) \Omega \Gamma(t)$;
+% Update parameters $\dot{\hat{\theta}} = \Gamma(t) ( \Phi(\hat{x})^{T} M (y - C\hat{x}) + \sum_{i=1}^{N} Z_{i}^{T} (Y_{i} - Z_{i} \hat{\theta}) )$;
+% \If{$t$ corresponds to a discrete time step $t_{k} \geq T$}{
+% Compute conformity score $s_{k} = \|Y(t_{k}) - Z(t_{k})\hat{\theta}_{k}\|$;
+% Compute indicator function $I = 1$ if $s_{k} \leq q_{k}$, else $I = 0$;
+% Update conformal threshold $q_{k+1} = \max(0, q_{k} + \eta_{k} (\alpha - I))$;
+% }
+% Maintain continuous threshold $q(t)$ via zero-order hold of $q_{k}$;
+% }
+% \end{algorithm}
+
+% \begin{theorem}
+% Under the stated assumptions, the observer error $\tilde{x}$ and the parameter estimation error $\tilde{\theta} = \theta^{*} - \hat{\theta}$ are uniformly ultimately bounded, with the nominal parameter error dynamics exhibiting exponential convergence.
+% \end{theorem}
+
+% \begin{proof}
+% Consider the radially unbounded Lyapunov candidate function incorporating the time-varying inverse covariance matrix
+
+
+% $$V = \frac{1}{2} \tilde{x}^{T} P \tilde{x} + \frac{1}{2} \tilde{\theta}^{T} \Gamma^{-1}(t) \tilde{\theta}$$
+
+
+% The time derivative of the observer error is governed by
+
+
+% $$\dot{\tilde{x}} = A_{L} \tilde{x} + \Phi(x)\theta^{*} - \Phi(\hat{x})\hat{\theta} + \delta(x) - L\epsilon$$
+
+
+% Adding and subtracting $\Phi(\hat{x})\theta^{*}$ isolates the parameter error and the Lipschitz bounded substitution error. We define an aggregate disturbance term $w(x, \hat{x}, t)$ containing the Lipschitz terms, the unstructured uncertainty, and the noise, which is bounded by $\|w\| \leq L_{w} \|\tilde{x}\| + \bar{\delta} + \|L\| \bar{\epsilon}$ for some Lipschitz constant $L_{w}$. Taking the time derivative of $V$ along the system trajectories yields
+
+
+% $$\dot{V} = \frac{1}{2} \dot{\tilde{x}}^{T} P \tilde{x} + \frac{1}{2} \tilde{x}^{T} P \dot{\tilde{x}} + \frac{1}{2} \tilde{\theta}^{T} \dot{\Gamma}^{-1}(t) \tilde{\theta} - \tilde{\theta}^{T} \Gamma^{-1}(t) \dot{\hat{\theta}}$$
+
+
+% Applying the matrix calculus identity for the derivative of an inverse matrix provides $\dot{\Gamma}^{-1}(t) = -\Gamma^{-1}(t) \dot{\Gamma}(t) \Gamma^{-1}(t)$. Substituting the Riccati equation into this identity yields $\dot{\Gamma}^{-1}(t) = -\beta \Gamma^{-1}(t) + \Omega$. Substituting this and the parameter update law into the Lyapunov derivative, and applying the strictly positive real condition $P = C^{T} M^{T}$ to cancel the adaptive cross terms, yields
+
+
+% $$\dot{V} \leq -\frac{1}{2} \lambda_{\min}(Q) \|\tilde{x}\|^{2} - \frac{\beta}{2} \lambda_{\min}(\Gamma^{-1}(t)) \|\tilde{\theta}\|^{2} - \frac{1}{2} \lambda_{\min}(\Omega) \|\tilde{\theta}\|^{2} + \|\tilde{x}\| \|P\| \|w\| + \|\tilde{\theta}\| \|e_{total}\|$$
+
+
+% By the singular value maximization logic, the finite excitation condition guarantees $\lambda_{\min}(\Omega) > 0$. The introduction of the recursive least squares covariance update introduces an explicitly strictly negative definite quadratic penalty on the parameter error driven by the forgetting factor $\beta$. Because $\dot{V}$ is strictly negative outside a compact set parameterized by the bounds on $w$ and $e_{total}$, the errors $\tilde{x}$ and $\tilde{\theta}$ are uniformly ultimately bounded.
+% \end{proof}
+
+% \begin{theorem}
+% The adaptive conformal prediction update exhibits a sublinear regret bound $R(K) \leq \mathcal{O}(\sqrt{K})$ with respect to the optimal fixed uncertainty threshold, proving asymptotic convergence to the tightest valid error bound.
+% \end{theorem}
+
+% \begin{proof}
+% The cumulative regret over $K$ steps against the best fixed threshold $q^{*}$ is
+
+
+% $$R(K) = \sum_{k=1}^{K} l_{k}(q_{k}) - \sum_{k=1}^{K} l_{k}(q^{*})$$
+
+
+% The pinball loss $l_{k}(q)$ is convex with respect to $q$, and its subgradient is strictly bounded as $|\nabla l_{k}(q_{k})| \leq \max(\alpha, 1-\alpha) \leq 1$. Let the gradient bound be $G = 1$. Evaluating the squared Euclidean distance to the optimal threshold $q^{*}$ using the specified online gradient descent update yields
+
+
+% $$(q_{k+1} - q^{*})^{2} \leq (q_{k} - q^{*})^{2} - 2\eta_{k} \nabla l_{k}(q_{k})(q_{k} - q^{*}) + \eta_{k}^{2} \|\nabla l_{k}(q_{k})\|^{2}$$
+
+
+% Applying the first-order convexity condition $l_{k}(q_{k}) - l_{k}(q^{*}) \leq \nabla l_{k}(q_{k})(q_{k} - q^{*})$ provides
+
+
+% $$2\eta_{k} (l_{k}(q_{k}) - l_{k}(q^{*})) \leq (q_{k} - q^{*})^{2} - (q_{k+1} - q^{*})^{2} + \eta_{k}^{2} G^{2}$$
+
+
+% Summing this inequality from $k=1$ to $K$ and selecting a decreasing step size sequence $\eta_{k} = D / (G\sqrt{k})$, where $D$ represents the maximum expected domain diameter of $q$, results in a telescoping sum bounded by
+
+
+% $$R(K) \leq \frac{D^{2}}{2\eta_{K}} + \frac{G^{2}}{2} \sum_{k=1}^{K} \eta_{k}$$
+
+
+% Approximating the summation with a definite integral yields the upper bound $R(K) \leq D G \sqrt{K}$. Consequently, the time-averaged regret $R(K)/K$ converges to zero as $K$ approaches infinity, confirming sublinear regret.
+% \end{proof}
+
+% \begin{theorem}
+% Consider the closed-loop system subject to the robust adaptive control barrier function quadratic program. If the initial observer state resides strictly within the safe set, and the quadratic program is continuously feasible, then the true system state remains within a rigorously bounded neighborhood of the safe set with probability at least $1-\alpha$ over the distribution of the unmodeled dynamics.
+% \end{theorem}
+
+% \begin{proof}
+% The time derivative of the barrier function evaluated on the true unmeasured state is governed by
+
+
+% $$\dot{h}(x) = L_{f} h(x) + L_{g} h(x)u + L_{\Phi} h(x)\theta^{*} + L_{g} h(x)\Delta(x)$$
+
+
+% By substituting the observer states into the vector fields and isolating the Lipschitz-bounded substitution errors, the true derivative can be expressed as the observer-based derivative perturbed by the state estimation error and the true matched unstructured uncertainty. The quadratic program explicitly enforces the inequality constraint
+
+
+% $$L_{g} h(\hat{x}) u \geq -\gamma(h(\hat{x})) - L_{f} h(\hat{x}) - L_{\Phi} h(\hat{x})\hat{\theta} - \frac{\partial h}{\partial \hat{x}} L \tilde{y} + c_{safe} q(t) \|L_{g} h(\hat{x})\|$$
+
+
+% Substituting this enforced constraint into the true barrier derivative expansion reveals that the conformal threshold term $c_{safe} q(t) \|L_{g} h(\hat{x})\|$ competes directly against the projection of the unmodeled dynamics and the state substitution error. Because Theorem 2 establishes that $q(t)$ upper-bounds the fixed-time integration of these precise lumped error sources with probability at least $1-\alpha$, selecting a sufficiently large constant $c_{safe}$ guarantees that the robust margin strictly dominates the perturbing dynamics. Consequently, the inequality $\dot{h}(\hat{x}) \geq -\gamma(h(\hat{x}))$ holds probabilistically, ensuring the strict forward invariance of the observer safe set. Because Theorem 1 establishes that the true state tracks the observer state within a uniformly ultimately bounded envelope, the true state is mathematically guaranteed to remain within a bounded neighborhood of the nominal safe set.
+% \end{proof}
+
+
+\section{Simulation}
+
+\section{Conclusion}
+
+\bibliographystyle{IEEEtran}
+\bibliography{biblio, IEEEabrv}
+\end{document}
+

@@ -1,0 +1,212 @@
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts, bbm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{setspace}
+\usepackage{booktabs}
+% \usepackage{caption}
+
+\usepackage{epsfig}
+\usepackage{times} 
+\usepackage{svg}
+% \usepackage{algorithmic}
+\usepackage[linesnumbered,ruled,vlined]{algorithm2e} 
+
+\usepackage[nolist, nohyperlinks]{acronym}
+
+% \usepackage{cite}
+% \usepackage[dvipsnames]{xcolor}
+% \usepackage{xurl}
+
+\usepackage{bm}
+\usepackage{breqn}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{tabularx}
+%\usepackage{cases}
+
+%\usepackage[ruled, vlined, linesnumbered, noend]{algorithm2e}
+% \usepackage[linesnumbered,ruled,vlined]{algorithm2e} 
+
+\let\proof\relax
+\let\endproof\relax
+\usepackage{amsthm}
+
+
+\newcommand{\Nbb}{\mathbb{N}}
+\newcommand{\Zbb}{\mathbb{Z}}
+\newcommand{\reals}{\mathbb{R}}
+\newcommand{\R}{\reals}
+\newcommand{\Rnonneg}{\reals_{\geq 0}}
+\newcommand{\Rplus}{\reals_{>0}}
+\newcommand{\Rinfty}{\overline{\R}}
+\renewcommand{\S}{\mathbb{S}}
+\newcommand{\SO}{\mathbb{SO}}
+\newcommand{\SE}{\mathbb{SE}}
+\newcommand{\so}{\mathfrak{so}}
+\newcommand{\se}{\mathfrak{se}}
+
+\newcommand{\naturals}{\mathbb{N}}
+\newcommand{\N}{\naturals}
+
+
+
+\newcommand{\sign}{\operatorname{sign}}
+
+\newcommand{\pd}{\mathcal{S}_{++}}
+\newcommand{\psd}{\mathcal{S}_{+}}
+
+\newcommand{\ball}{\mathcal{B}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\dist}{\operatorname{dist}}
+\newcommand{\Haus}{\operatorname{Haus}}
+
+\newcommand{\eps}{\varepsilon}
+
+\newcommand{\toSet}{\rightrightarrows}
+
+\newcommand{\Exp}{\operatorname{Exp}}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\Ad}{\operatorname{Ad}}
+\newcommand{\Adm}{\bm{\mathrm{Ad}}}
+
+
+\newcommand{\Acal}{\mathcal{A}}
+\newcommand{\Bcal}{\mathcal{B}}
+\newcommand{\Ccal}{\mathcal{C}}
+\newcommand{\Dcal}{\mathcal{D}}
+\newcommand{\Ecal}{\mathcal{E}}
+\newcommand{\Fcal}{\mathcal{F}}
+\newcommand{\Gcal}{\mathcal{G}}
+\newcommand{\Hcal}{\mathcal{H}}
+\newcommand{\Ical}{\mathcal{I}}
+\newcommand{\Jcal}{\mathcal{J}}
+\newcommand{\Kcal}{\mathcal{K}}
+\newcommand{\Lcal}{\mathcal{L}}
+\newcommand{\Mcal}{\mathcal{M}}
+\newcommand{\Ncal}{\mathcal{N}}
+\newcommand{\Ocal}{\mathcal{O}}
+\newcommand{\Pcal}{\mathcal{P}}
+\newcommand{\Qcal}{\mathcal{Q}}
+\newcommand{\Rcal}{\mathcal{R}}
+\newcommand{\Scal}{\mathcal{S}}
+\newcommand{\Tcal}{\mathcal{T}}
+\newcommand{\Ucal}{\mathcal{U}}
+\newcommand{\Vcal}{\mathcal{V}}
+\newcommand{\Wcal}{\mathcal{W}}
+\newcommand{\Xcal}{\mathcal{X}}
+\newcommand{\Ycal}{\mathcal{Y}}
+\newcommand{\Zcal}{\mathcal{Z}}
+
+
+\newcommand{\classK}{class~$\mathcal{K}$ }
+\newcommand{\classKinf}{class~$\mathcal{K}_\infty$ }
+\newcommand{\classEKinf}{class~$\mathcal{K}_{e, \infty}$ }
+\newcommand{\classKL}{class~$\mathcal{KL}$ }
+
+
+\newcommand{\eqn}[1]{\begin{align} #1 \end{align}}
+\newcommand{\eqnN}[1]{\begin{align*} #1 \end{align*}}
+\newcommand{\seqn}[2][]{
+\begin{subequations}
+    #1
+\begin{align} #2 \end{align}
+\end{subequations}
+}
+\newcommand{\bmat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+\newcommand{\todo}[1]{{\color{red} TODO:[#1]}}
+\newcommand{\note}[1]{{\color{blue} NOTE: [#1]}}
+\newcommand{\edit}[1]{{\color{blue} #1}}
+\newcommand{\norm}[1]{\left\Vert #1 \right \Vert}
+\newcommand{\fronorm}[1]{\left\Vert #1 \right \Vert_F}
+\newcommand{\abs}[1]{\left | #1 \right |}
+\newcommand{\Linf}{{\mathcal{L}_\infty}}
+\newcommand{\rank}[1]{\operatorname{rank}\left(#1\right)}
+\newcommand{\tr}[1]{\operatorname{tr}\left(#1\right)}
+\newcommand{\sigpow}[2]{\left \lceil #1 \right \rfloor^{#2}}
+\newcommand{\argmin}[1]{\underset{\substack{#1}}{\text{argmin}}}
+
+\newcommand{\Int}{\operatorname{Int}}
+\newcommand{\size}{\operatorname{size}}
+
+
+
+\newcommand{\proj}[2]{\operatorname{Proj}(#1, #2)}
+
+% \newenvironment{nospaceflalign*}
+%  {\setlength{\abovedisplayskip}{0pt}\setlength{\belowdisplayskip}{0pt}%
+%   \csname flalign*\endcsname}
+%  {\csname endflalign*\endcsname\ignorespacesafterend}
+
+%% There are a number of predefined theorem-like environments in
+%% ifacconf.cls:
+%%
+%% \begin{thm} ... \end{thm}            % Theorem
+%% \begin{lem} ... \end{lem}            % Lemma
+%% \begin{claim} ... \end{claim}        % Claim
+%% \begin{conj} ... \end{conj}          % Conjecture
+%% \begin{cor} ... \end{cor}            % Corollary
+%% \begin{fact} ... \end{fact}          % Fact
+%% \begin{hypo} ... \end{hypo}          % Hypothesis
+%% \begin{prop} ... \end{prop}          % Proposition
+%% \begin{crit} ... \end{crit}          % Criterion
+
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{problem}{Problem}
+\newtheorem{definition}{Definition}
+\newtheorem{prop}{Proposition}
+
+% \newtheorem{corollary}{Corollary}%[theorem]
+\theoremstyle{definition}
+\newtheorem{assumption}{Assumption}
+\newtheorem{remark}{Remark}
+\newtheorem{property}{Property}
+
+% \newtheorem{problem}{Problem}
+\theoremstyle{remark}
+
+\newtheorem{example}{Example}
+\newtheorem{case}{Case Study}
+
+\newtheorem{ex}{Example}
+%\newtheorem{ex/}{Example}
+%
+%\newenvironment{ex}
+%  {\renewcommand{\qedsymbol}{//}%
+%   \pushQED{\qed}\begin{ex/}}
+%  {\popQED\end{ex/}}
+
+\makeatletter
+\let\NAT@parse\undefined
+\makeatother
+\usepackage{hyperref}
+\hypersetup{
+colorlinks, 
+    linkcolor={red!50!black},
+    citecolor={blue!50!black},
+    urlcolor={blue!80!black}
+}
+\usepackage{cleveref}
+
+
+\crefformat{problem}{Problem~#2#1#3}
+\crefformat{assumption}{Assumption~#2#1#3}
+
+
+
+\usepackage[nolist,nohyperlinks]{acronym}
+\newcommand{\gk}{\texttt{gatekeeper}}
+
+
+\newcommand{\x}{\mathrm{x}}
+\newcommand{\X}{\mathrm{X}}
+\renewcommand{\u}{\mathrm{u}}
+\newcommand{\w}{\mathrm{w}}
+\newcommand{\com}{\text{com}}
+\newcommand{\nom}{\text{nom}}
+\newcommand{\can}{\text{can}}
