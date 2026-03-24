@@ -23,18 +23,18 @@ def main():
     t_end = 5.0  # Point-to-point navigation time
 
     # Initialize Architecture Components
-    sys_plant = Plant()
+    sys_plant = Plant(spatial_mode=True)
     
     # Define Obstacles (Large+small pair creating narrow gap, small further along)
     obstacles = [
         {'pos': np.array([3.0, -1.2, 1.0]), 'r': 0.8},  # Large obstacle, below path
         {'pos': np.array([3.0,  0.7, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
-        {'pos': np.array([6.5,  0.0, 1.0]), 'r': 0.3},  # Small obstacle further along path
+        {'pos': np.array([6.5,  0.0, 1.0]), 'r': 0.5},  # Small obstacle further along path
     ]
     x_goal = np.array([8.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     # Using DTMPC with full-state feedback and 3D Quadcopter
-    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=6, dt=dt)
+    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=8, dt=dt)
     
     # OCP for Drift bounds
     ocp_drift = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
@@ -45,8 +45,9 @@ def main():
     theta_0_flat = flatten_params(model).clone().detach()
     theta_flat = flatten_params(model).clone().detach()
     # Adaptation Parameters
-    gamma_lr = 0.5
-    lambd = 0.01
+
+    gamma_lr = 0.2
+    lambd = 0.1
 
     # State variables (8 elements: pos, vel, roll, pitch)
     x = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # start at offset
@@ -194,10 +195,25 @@ def main():
         residual_plotting.append(np.linalg.norm(error_acc))
         Ld_plotting.append(L_d)
 
+        # Collision check
+        stop_flag = False
+        for obs in obstacles:
+            if np.linalg.norm(x[:3] - obs['pos']) < obs['r']:
+                print(f"COLLISION at t={t:.2f}s! Penetrated obstacle at {obs['pos']}")
+                stop_flag = True
+                break
+        # Stop when close enough to goal
+        goal_dist = np.linalg.norm(x[:3] - x_goal[:3])
+        if goal_dist < 0.1:
+            print(f"Goal reached at t={t:.2f}s! Distance: {goal_dist:.3f}m")
+            stop_flag = True
+        if stop_flag:
+            break
+
         # every 10 time steps, print out how long it took the run the loop
         t_end_timer = time.time()
         if int(t/dt) % 10 == 0:
-            print(f"Loop took {t_end_timer - t_start:.4f} seconds")
+            print(f"t: {t:.2f}, 10 steps took {t_end_timer - t_start:.4f} seconds")
             # print(f"t: {t:.2f}, x: {x[0]:.2f}, {x[1]:.2f}, {x[2]:.2f}, v: {x[3]:.2f}, {x[4]:.2f}, {x[5]:.2f}, u: {u[0]:.2f}, {u[1]:.2f}, {u[2]:.2f}, S_drift: {S_drift:.2f}, q_drift: {q_drift:.2f}, dist_bound: {dist_bound_plotting[-1]:.2f}")
 
     # Append terminal target since while loop offsets it by 1
@@ -390,13 +406,7 @@ def main():
     line_pred, = ax_anim.plot([], [], [], 'g--', label='MPC Prediction', linewidth=1)
     scatter_pred = ax_anim.scatter([], [], [], color='cyan', alpha=0.3, label='Tube Envelope')
     
-    # Draw spherical obstacles
-    for obs in obstacles:
-        u_sphere_anim, v_sphere_anim = np.mgrid[0:2*np.pi:10j, 0:np.pi:6j]
-        ox = obs['pos'][0] + obs['r'] * np.cos(u_sphere_anim) * np.sin(v_sphere_anim)
-        oy = obs['pos'][1] + obs['r'] * np.sin(u_sphere_anim) * np.sin(v_sphere_anim)
-        oz = obs['pos'][2] + obs['r'] * np.cos(v_sphere_anim)
-        ax_anim.plot_surface(ox, oy, oz, color='red', alpha=0.2)
+
     
     ax_anim.scatter(x_goal[0], x_goal[1], x_goal[2], color='gold', marker='*', s=100)
     
@@ -428,10 +438,24 @@ def main():
         sys_plant.Phi = tube_history[k] # update for title if needed
         ax_anim.set_title(rf'DTMPC 3D Flight | Time: {t_history[k]:.1f}s | $\Phi$: {tube_history[k]:.2f}m')
         return scatter_true, line_true, line_ref, line_pred, scatter_pred
+
+    # Draw spherical obstacles
+    for obs in obstacles:
+        u_sphere_anim, v_sphere_anim = np.mgrid[0:2*np.pi:10j, 0:np.pi:6j]
+        ox = obs['pos'][0] + obs['r'] * np.cos(u_sphere_anim) * np.sin(v_sphere_anim)
+        oy = obs['pos'][1] + obs['r'] * np.sin(u_sphere_anim) * np.sin(v_sphere_anim)
+        oz = obs['pos'][2] + obs['r'] * np.cos(v_sphere_anim)
+        ax_anim.plot_surface(ox, oy, oz, color='red', alpha=1.0)
         
-    ax_anim.set_xlim([np.min(x_history[:,0])-0.5, np.max(x_history[:,0])+0.5])
-    ax_anim.set_ylim([np.min(x_history[:,1])-0.5, np.max(x_history[:,1])+0.5])
-    ax_anim.set_zlim([np.min(x_history[:,2])-0.5, np.max(x_history[:,2])+0.5])
+    # Corridor-style rectangle with equal physical scale (1m = 1m on all axes)
+    x_lo, x_hi = np.min(x_history[:,0])-0.5, np.max(x_history[:,0])+0.5
+    y_lo, y_hi = -2.5, 2.5
+    z_lo, z_hi = 0.0, 2.0
+    ax_anim.set_xlim([x_lo, x_hi])
+    ax_anim.set_ylim([y_lo, y_hi])
+    ax_anim.set_zlim([z_lo, z_hi])
+    # Equal physical scale: box is stretched proportionally to the data ranges
+    ax_anim.set_box_aspect([x_hi-x_lo, y_hi-y_lo, z_hi-z_lo])
     ax_anim.set_xlabel('X')
     ax_anim.set_ylabel('Y')
     ax_anim.set_zlabel('Z')

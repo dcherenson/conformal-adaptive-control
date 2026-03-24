@@ -274,11 +274,14 @@ class DynamicTubeMPC:
         self.dt = dt
         self.eta = eta
         self.T_horizon = T_horizon
+        self.z_min = 0.8   # Altitude floor (m)
+        self.z_max = 1.2   # Altitude ceiling (m)
         
         self.u_max = 30.0  # Increased for z-axis gravity compensation
         self.alpha_min = 0.1
         self.alpha_max = 10.0
         self.Phi = 0.1  # Initial tube size
+        self._prev_opt = None  # Warm-start: previous solution
 
     def compute_u(self, x: np.ndarray, xd: np.ndarray, 
                   q_drift: float, model_nn=None):
@@ -335,9 +338,13 @@ class DynamicTubeMPC:
             z = np.copy(x)
             phi = self.Phi
             for j in range(self.H):
-                # Vectorized distance to all obstacles
+                # Obstacle clearance constraints (vectorized)
                 dists = np.linalg.norm(z[0:3] - obs_positions, axis=1)
                 cons.extend(dists - obs_radii - phi)
+                
+                # Altitude constraints: z_min <= z[2] <= z_max
+                cons.append(z[2] - self.z_min)         # z >= z_min
+                cons.append(self.z_max - z[2])         # z <= z_max
                 
                 # Step z
                 z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
@@ -348,13 +355,22 @@ class DynamicTubeMPC:
                 
             return np.array(cons)
 
-        OPT_init = np.zeros(4 * self.H)
-        
-        # Initialize virtual control for hovering to handle gravity: u = m*g = 9.81 on the z-axis
-        for j in range(self.H):
-            OPT_init[j*3 + 2] = 9.81 * self.plant.m
-            
-        OPT_init[3*self.H:] = 1.0  # Initialize alphas to 1.0
+        # Warm-start: shift previous solution by one step, or fall back to hover
+        if self._prev_opt is not None:
+            OPT_init = np.zeros(4 * self.H)
+            # Shift V: drop first, repeat last
+            prev_V = self._prev_opt[:3*self.H].reshape(self.H, 3)
+            OPT_init[:3*(self.H-1)] = prev_V[1:].flatten()
+            OPT_init[3*(self.H-1):3*self.H] = prev_V[-1]  # repeat last
+            # Shift alphas
+            prev_a = self._prev_opt[3*self.H:]
+            OPT_init[3*self.H:4*self.H-1] = prev_a[1:]
+            OPT_init[4*self.H-1] = prev_a[-1]
+        else:
+            OPT_init = np.zeros(4 * self.H)
+            for j in range(self.H):
+                OPT_init[j*3 + 2] = 9.81 * self.plant.m
+            OPT_init[3*self.H:] = 1.0
         
         cons_dict = {'type': 'ineq', 'fun': constraints}
         bnds = []
@@ -362,9 +378,16 @@ class DynamicTubeMPC:
             bnds.extend([(-5.0, 5.0), (-5.0, 5.0), (0.0, 30.0)]) # Roll/Pitch rate bounds, Thrust bounds
         bnds.extend([(self.alpha_min, self.alpha_max)] * self.H)
         
-        res = minimize(objective, OPT_init, method='SLSQP', bounds=bnds, constraints=cons_dict, options={'ftol': 1e-2, 'maxiter': 20})
+        res = minimize(objective, OPT_init, method='SLSQP', bounds=bnds, constraints=cons_dict, options={'ftol': 1e-2, 'maxiter': 25})
         
-        if res.success or res.status == 4 or res.status == 8: # If reached iteration limit but found something
+        if res.success or res.status == 9: # 0=success, 9=iteration limit but has a point
+            # If solver hit iteration limit, verify no obstacle is penetrated
+            if not res.success:
+                test_cons = constraints(res.x)
+                if np.any(test_cons < -0.05):  # allow tiny numerical tolerance
+                    return np.zeros(3), np.zeros((self.H, 8)), np.zeros(self.H), False
+            
+            self._prev_opt = res.x  # Store for warm-start next iteration
             V_opt = res.x[:3*self.H].reshape(self.H, 3)
             alphas_opt = res.x[3*self.H:]
             

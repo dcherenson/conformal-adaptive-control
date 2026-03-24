@@ -7,10 +7,10 @@ class Plant:
     State x = [px, py, pz, vx, vy, vz, phi, theta]^T
     Control u = [p, q, T]^T (Roll rate, Pitch rate, Net Thrust)
     """
-    def __init__(self):
+    def __init__(self, spatial_mode=False):
         self.m = 1.0  # kg
         self.g = np.array([0, 0, -9.81])
-        self.spatial_mode = False  # Toggle for online spatial gradient shift
+        self.spatial_mode = spatial_mode  # Toggle for online spatial gradient shift
         
         # We don't use theta_true for concurrent learning anymore, but keep for compatibility if needed elsewhere
         self.theta_true = np.array([0.5, 0.2])
