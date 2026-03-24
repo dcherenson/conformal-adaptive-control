@@ -12,4 +12,5 @@ dependencies = [
     "osqp>=1.1.1",
     "qpsolvers>=4.11.0",
     "scipy>=1.17.1",
+    "torch>=2.10.0",
 ]

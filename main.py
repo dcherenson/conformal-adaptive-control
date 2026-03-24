@@ -1,213 +1,153 @@
 import numpy as np
-from matplotlib import pyplot as plt
+import torch
+import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 plt.switch_backend('Agg')
 
 # Architecture Modules
 from plant import Plant
-from sensor import Sensor
-from observer import Observer
-from adaptation import Adaptation
-from ocp import DriftScoreOCP, InnovationScoreOCP
-from controller import SafetyCriticalController, RobustTubeMPC
-from high_level_objective import HighLevelObjective
-from design_gains import solve_lmi_gains, get_stable_adaptation_gain
+from ocp import DriftScoreOCP
+from controller import DynamicTubeMPC
+
+# SSML Modules
+from ssml import get_or_train_model, flatten_params, assign_params, compute_jacobian, spectral_normalization_clip, get_reference
 
 def main():
     np.random.seed(42)
+    torch.manual_seed(42)
 
     # Simulation Variables
     t = 0.0
-    dt = 0.1
+    dt = 0.05   # slightly coarser than ssml.py to ensure 3D MPC completes in reasonable time (H=8 becomes 0.4s horizon)
+    t_end = 15.0  # Run for 15 seconds to see tracking and obstacle avoidance
 
     # Initialize Architecture Components
     sys_plant = Plant()
     
-    # Observation matrix: Only position is measured
-    C = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0]
-    ])
-    sys_sensor = Sensor(C=C, noise_std=0.1)
+    # Using DTMPC with full-state feedback and 3D Quadcopter
+    sys_controller = DynamicTubeMPC(plant=sys_plant, x_obs=np.array([0.0, 0.0, 1.0]), d_safe=0.5, H=8, dt=dt)
     
-    # Observer gain L must be 4x2
-    # Designing L via LMI for a desired decay rate alpha
-    A_lin = np.array([
-        [0, 0, 1,    0],
-        [0, 0, 0,    1],
-        [0, 0, -0.5, 0],
-        [0, 0, 0,    -0.5]
-    ])
-    L, _ = solve_lmi_gains(A_lin, C, alpha=1.5)
-    sys_observer = Observer(plant=sys_plant, C=C, L=L)
-    
-    sys_adaptation = Adaptation(num_states=4, num_features=2, max_capacity=10, tolerance=1e-3)
-    
+    # OCP for Drift bounds
     ocp_drift = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
-    ocp_inn = InnovationScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
-    
-    # Toggle which controller to use:
-    sys_controller = SafetyCriticalController(plant=sys_plant, x_obs=np.array([1.0, 1.1]), d_safe=0.5)
-    # sys_controller = RobustTubeMPC(plant=sys_plant, x_obs=np.array([1.0, 1.1]), d_safe=0.5, H=8)
-    
-    sys_objective = HighLevelObjective()
 
-    # State variables (4 elements)
-    x = np.array([0.0, 0.0, 0.0, 0.0])
-    xhat = np.array([0.0, 0.0, 0.0, 0.0])
-    theta_hat = np.array([0.0, 0.0])
-    u = np.array([0.0, 0.0])
+    # SSML Network Initialization
+    model = get_or_train_model()
+    theta_0_flat = flatten_params(model).clone().detach()
+    theta_flat = flatten_params(model).clone().detach()
+    gamma_lr = 0.01
+    lambd = 0.1
+
+    # State variables (6 elements)
+    x = np.array([0.0, -0.5, 0.0, 0.0, 0.0, 0.0]) # start at origin
+    u = np.array([0.0, 0.0, 9.81 * sys_plant.m])
 
     # Tracking arrays
     x_plotting = [np.copy(x)]
-    xhat_plotting = [np.copy(xhat)]
     t_plotting = [t]
-    stack_eigenvalues = [sys_adaptation.check_pe()]
     
     # OCP Tracking
     drift_scores = [0.0]
     drift_quantiles = [ocp_drift.get_quantile()]
-    inn_scores = [0.0]
-    inn_quantiles = [ocp_inn.get_quantile()]
-
-    # Parameter and Error Tracking
-    Gamma = 5.0 * np.eye(2) # Adaptation learning rate
-    theta_plotting = [np.copy(theta_hat)]
-    theta_err_plotting = [np.copy(theta_hat - sys_plant.theta_true)]
-    residual_err_plotting = [np.linalg.norm(sys_plant.F(x) @ (theta_hat - sys_plant.theta_true) - sys_plant.Delta(x, t))]
-    state_err_plotting = [np.linalg.norm(xhat - x)]
-    
-    x_bar_m_init = (ocp_inn.get_quantile() + sys_controller.epsilon_bar) / sys_controller.C_m_min_sv
-    x_bar_u_init = ocp_drift.get_quantile()
-    state_err_bound_plotting = [x_bar_m_init + x_bar_u_init]
     dist_bound_plotting = [ocp_drift.get_quantile() / sys_controller.T_horizon]
 
+    # Target plotting
+    xd_plotting = []
+
+    print("Running SSML DTMPC 3D Flight Simulation...")
+
     # Simulation Loop
-    while t <= 15.0:
-        # High Level Objective Output
-        xd = sys_objective.get_reference(t)
+    while t <= t_end:
+        # High Level Objective Output from SSML (Figure-8)
+        p_d, v_d, a_d = get_reference(t)
+        xd = np.concatenate([p_d, v_d])
+        xd_plotting.append(np.copy(xd))
 
-        # Sensor Output
-        y = sys_sensor.measure(x)
-
-        # State Observer updates
-        # To avoid lag, Observer runs its derivative
-        # The true controller would use xhat, OCP scores, and xd. For now, u=0.
+        # Controller computes 3D control force
         u_old = np.copy(u)
-        # u = sys_controller.compute_u(xhat, theta_hat, xd, drift_quantiles[-1], inn_quantiles[-1])
-        u = sys_controller.nominal_controller(xhat, xd)
+        u = sys_controller.compute_u(x, xd, drift_quantiles[-1], model_nn=model)
 
-        xhat_dot = sys_observer.compute_xhat_dot(xhat, u, theta_hat, y)
-        xhat_old = np.copy(xhat)
-        xhat += xhat_dot * dt
+        x_old = np.copy(x)
 
-        # Update CL Stack and Gamma via LMI Stability Bound
-        X_mat = sys_observer.compute_X(xhat, xhat_old, u, u_old, dt)
-        Z_mat = sys_observer.compute_Z(xhat, xhat_old, dt)
-        sys_adaptation.update_stack(X_mat, Z_mat)
+        # Plant integrates one step forward with true wind disturbance
+        x = sys_plant.step(x_old, u, t, dt)
+
+        # Measure acceleration finite difference
+        v_old = x_old[3:6]
+        v_new = x[3:6]
+        dv_measured = (v_new - v_old) / dt
         
-        # Dynamic Gamma synthesis
-        Omega = sys_adaptation.get_information_matrix()
-        Gamma = get_stable_adaptation_gain(Omega, dt=dt)
+        # Nominal acceleration (without wind/mismatch)
+        dv_nominal = np.array([0, 0, -9.81]) + u_old / sys_plant.m
         
-        # Adaptation updates learns theta
-        cl_grad = sys_adaptation.get_cl_grad(theta_hat)
-        theta_hat_dot = Gamma @ cl_grad.flatten()
-        theta_hat += theta_hat_dot * dt
+        # True acceleration mismatch
+        true_mismatch = dv_measured - dv_nominal
+
+        # Neural Network prediction
+        x_in = np.concatenate((x_old, u_old))
+        with torch.no_grad():
+            f_nn_full = model(torch.tensor(x_in, dtype=torch.float32)).numpy()
+        pred_mismatch = f_nn_full[3:6]
         
-        # Plant integrates one step forward
-        x = sys_plant.step(x, u, t, dt)
+        # Error between true and prediction
+        error_acc = true_mismatch - pred_mismatch
         
         # OCP Updates
-        y_hat = sys_observer.get_y_hat(xhat)
-        
-        S_inn = ocp_inn.compute_score(y, y_hat)
-        q_inn = ocp_inn.update(S_inn)
-        
-        S_drift = ocp_drift.compute_score(X_mat, Z_mat, theta_hat)
+        S_drift = np.linalg.norm(error_acc)
         q_drift = ocp_drift.update(S_drift)
+
+        # Adaptation updates learns theta online
+        # Lift 3D error to 6D output error for SSML net: [0, 0, 0, ex, ey, ez]
+        output_error = np.concatenate((np.zeros(3), error_acc))
+        J = compute_jacobian(model, x_in).detach().numpy()
+        
+        theta_dot = gamma_lr * np.dot(J.T, output_error) - lambd * (
+            theta_flat.detach().numpy() - theta_0_flat.numpy()
+        )
+        theta_flat = theta_flat + torch.tensor(theta_dot, dtype=torch.float32) * dt
+        
+        assign_params(model, theta_flat)
+        spectral_normalization_clip(model)
 
         # Append variables for graphing
         t += dt
         x_plotting.append(np.copy(x))
-        xhat_plotting.append(np.copy(xhat))
         t_plotting.append(t)
-        stack_eigenvalues.append(sys_adaptation.check_pe())
         drift_scores.append(S_drift)
         drift_quantiles.append(q_drift)
-        inn_scores.append(S_inn)
-        inn_quantiles.append(q_inn)
-        
-        theta_plotting.append(np.copy(theta_hat))
-        theta_err = theta_hat - sys_plant.theta_true
-        theta_err_plotting.append(np.copy(theta_err))
-        res_err = np.linalg.norm(sys_plant.F(x) @ theta_err - sys_plant.Delta(x, t))
-        residual_err_plotting.append(res_err)
-        state_err_plotting.append(np.linalg.norm(xhat - x))
-        
-        x_bar_m = (q_inn + sys_controller.epsilon_bar) / sys_controller.C_m_min_sv
-        x_bar_u = q_drift
-        state_err_bound_plotting.append(x_bar_m + x_bar_u)
         dist_bound_plotting.append(q_drift / sys_controller.T_horizon)
 
-    print("Final history stack valid X_hist:\\n", sys_adaptation.history_stack.X_hist[:sys_adaptation.history_stack.current_size])
+    # Append terminal target since while loop offsets it by 1
+    p_d, v_d, a_d = get_reference(t)
+    xd_plotting.append(np.concatenate([p_d, v_d]))
 
     # Convert lists to arrays for editing plots
     x_history = np.array(x_plotting)
-    xhat_history = np.array(xhat_plotting)
     t_history = np.array(t_plotting)
-    eigenvalue_history = np.array(stack_eigenvalues)
-    theta_history = np.array(theta_plotting)
-    theta_err_history = np.array(theta_err_plotting)
-    res_err_history = np.array(residual_err_plotting)
-    state_err_history = np.array(state_err_plotting)
-    state_err_bound_history = np.array(state_err_bound_plotting)
+    xd_history = np.array(xd_plotting)
     dist_bound_history = np.array(dist_bound_plotting)
 
     # Subplots
-    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(10, 20))
+    fig, (ax1, ax5) = plt.subplots(2, 1, figsize=(10, 10))
 
     # Plot x vs time
-    ax1.plot(t_history, x_history[:, 0], 'b-', label='x[0]', linewidth=2)
-    ax1.plot(t_history, x_history[:, 1], 'r-', label='x[1]', linewidth=2)
+    ax1.plot(t_history, x_history[:, 0], 'b-', label='x[0] px', linewidth=2)
+    ax1.plot(t_history, x_history[:, 1], 'r-', label='x[1] py', linewidth=2)
+    ax1.plot(t_history, x_history[:, 2], 'g-', label='x[2] pz', linewidth=2)
+    ax1.plot(t_history, xd_history[:, 0], 'b--', alpha=0.5)
+    ax1.plot(t_history, xd_history[:, 1], 'r--', alpha=0.5)
+    ax1.plot(t_history, xd_history[:, 2], 'g--', alpha=0.5)
     ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('x')
-    ax1.set_title('Plant True State x vs Time')
+    ax1.set_ylabel('Position (m)')
+    ax1.set_title('Plant 3D State Tracking vs Time')
     ax1.legend()
     ax1.grid(True)
 
-    # Plot xhat vs time
-    ax2.plot(t_history, xhat_history[:, 0], 'b--', label='xhat[0]', linewidth=2)
-    ax2.plot(t_history, xhat_history[:, 1], 'r--', label='xhat[1]', linewidth=2)
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('xhat')
-    ax2.set_title('Observer Estimated State xhat vs Time')
-    ax2.legend()
-    ax2.grid(True)
-
-    # Plot minimum eigenvalue vs time
-    ax3.plot(t_history, eigenvalue_history, 'g-', linewidth=2)
-    ax3.set_xlabel('Time (s)')
-    ax3.set_ylabel('Min Eigenvalue')
-    ax3.set_title('Adaptation: Minimum Eigenvalue vs Time')
-    ax3.grid(True)
-    ax3.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-    
-    # Plot Innovation Score vs Quantile
-    ax4.plot(t_history, inn_scores, 'm-', label='Innovation Score $S_{inn,k}$', linewidth=2)
-    ax4.plot(t_history, inn_quantiles, 'k--', label='Innovation Quantile $q_{inn,k}$', linewidth=2)
-    ax4.set_xlabel('Time (s)')
-    ax4.set_ylabel('Value')
-    ax4.set_title('Sensor Innovation Score vs Quantile Threshold')
-    ax4.legend()
-    ax4.grid(True)
-    
     # Plot Drift Score vs Quantile
     ax5.plot(t_history, drift_scores, 'c-', label='Drift Score $S_{drift,k}$', linewidth=2)
     ax5.plot(t_history, drift_quantiles, 'k--', label='Drift Quantile $q_{drift,k}$', linewidth=2)
     ax5.set_xlabel('Time (s)')
     ax5.set_ylabel('Value')
-    ax5.set_title('Observer Drift Score vs Quantile Threshold')
+    ax5.set_title('Neural Acceleration Mismatch Score vs Quantile Threshold')
     ax5.legend()
     ax5.grid(True)
 
@@ -215,143 +155,44 @@ def main():
     plt.savefig('architecture_state_comparison.png', dpi=150, bbox_inches='tight')
     print("Plot saved to architecture_state_comparison.png")
 
-    # --- Validation Checks ---
-    distances_to_obs = np.sqrt((x_history[:,0] - sys_controller.x_obs[0])**2 + (x_history[:,1] - sys_controller.x_obs[1])**2)
-    min_dist = np.min(distances_to_obs)
-    print(f"Minimum distance to obstacle center: {min_dist:.3f} (Constraint: {sys_controller.d_safe:.3f})")
-    print(f"Final position: [{x_history[-1,0]:.3f}, {x_history[-1,1]:.3f}] (Target: {xd[0]:.3f}, {xd[1]:.3f})")
-
-    # --- 2D Position vs Time Plot ---
-    fig_pos, ax_pos = plt.subplots(figsize=(8, 4))
-    ax_pos.plot(t_history, x_history[:, 0], label='px(t)', color='blue')
-    ax_pos.plot(t_history, x_history[:, 1], label='py(t)', color='orange')
-    ax_pos.axhline(y=xd[0], color='blue', linestyle='--', alpha=0.5, label='Target px')
-    ax_pos.axhline(y=xd[1], color='orange', linestyle='--', alpha=0.5, label='Target py')
-    ax_pos.set_xlabel('Time (s)')
-    ax_pos.set_ylabel('Position')
-    ax_pos.set_title('2D Position vs Time (Target Tracking)')
+    # --- 3D Position vs Time Plot ---
+    fig_pos = plt.figure(figsize=(8, 6))
+    ax_pos = fig_pos.add_subplot(111, projection='3d')
+    ax_pos.plot(x_history[:, 0], x_history[:, 1], x_history[:, 2], label='Trajectory', color='blue')
+    ax_pos.plot(xd_history[:, 0], xd_history[:, 1], xd_history[:, 2], label='Target (Fig-8)', color='orange', linestyle='--')
+    
+    # Draw spherical obstacle
+    u_sphere, v_sphere = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+    obs_x = sys_controller.x_obs[0] + sys_controller.d_safe * np.cos(u_sphere) * np.sin(v_sphere)
+    obs_y = sys_controller.x_obs[1] + sys_controller.d_safe * np.sin(u_sphere) * np.sin(v_sphere)
+    obs_z = sys_controller.x_obs[2] + sys_controller.d_safe * np.cos(v_sphere)
+    ax_pos.plot_surface(obs_x, obs_y, obs_z, color='red', alpha=0.3)
+    
+    ax_pos.set_xlabel('X Position')
+    ax_pos.set_ylabel('Y Position')
+    ax_pos.set_zlabel('Z Position')
+    ax_pos.set_title('3D Trajectory Tracking & Obstacle Avoidance')
     ax_pos.legend()
-    ax_pos.grid(True)
     fig_pos.tight_layout()
     fig_pos.savefig('pos_vs_time.png', dpi=150, bbox_inches='tight')
     print("Plot saved to pos_vs_time.png")
 
-    # --- Parameter Estimation Plot ---
-    fig_param, (ax_p1, ax_p2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    ax_p1.plot(t_history, theta_history[:, 0], label=r'$\hat{\theta}_1$')
-    ax_p1.plot(t_history, theta_history[:, 1], label=r'$\hat{\theta}_2$')
-    ax_p1.axhline(sys_plant.theta_true[0], color='r', linestyle='--', label=r'$\theta_{1,true}$')
-    ax_p1.axhline(sys_plant.theta_true[1], color='g', linestyle='--', label=r'$\theta_{2,true}$')
-    ax_p1.set_xlabel('Time (s)')
-    ax_p1.set_title(r'Parameter Estimates $\hat{\theta}$ vs Time')
-    ax_p1.legend()
-    ax_p1.grid(True)
-    
-    ax_p2.plot(t_history, theta_err_history[:, 0], label=r'$\tilde{\theta}_1$')
-    ax_p2.plot(t_history, theta_err_history[:, 1], label=r'$\tilde{\theta}_2$')
-    ax_p2.set_xlabel('Time (s)')
-    ax_p2.set_title(r'Parameter Estimation Error $\tilde{\theta}$ vs Time')
-    ax_p2.legend()
-    ax_p2.grid(True)
-    
-    fig_param.tight_layout()
-    fig_param.savefig('parameter_estimation.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to parameter_estimation.png")
-
-    # --- Residual and State Error Plot ---
-    fig_err, (ax_e1, ax_e2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    ax_e1.plot(t_history, res_err_history, 'g-', linewidth=2)
-    ax_e1.plot(t_history, res_err_history, 'r-')
-    ax_e1.set_xlabel('Time (s)')
-    ax_e1.set_ylabel(r'|| F(x)$\tilde{\theta}$ - $\Delta(x,t)$ ||')
-    ax_e1.set_title('True Residual / Approximation Error over Time')
-    ax_e1.grid(True)
-    
-    ax_e2.plot(t_history, state_err_history, 'b-')
-    ax_e2.set_xlabel('Time (s)')
-    ax_e2.set_ylabel(r'|| $\hat{x}$ - x ||')
-    ax_e2.set_title('State Estimation Error Norm vs Time')
-    ax_e2.grid(True)
-    
-    fig_err.tight_layout()
-    fig_err.savefig('residuals_and_state_error.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to residuals_and_state_error.png")
-    
-    # --- OCP Bounds vs True Error Plot ---
-    fig_bounds, (ax_b1, ax_b2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    ax_b1.plot(t_history, res_err_history, 'g-', label=r'True Disturbance ||F(x)$\tilde{\theta}$ - $\Delta(x,t)$||', linewidth=2)
+    # --- OCP Bounds Plot ---
+    fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 4))
+    ax_b1.plot(t_history, drift_scores, 'g-', label=r'True Mismatch Norm', linewidth=2)
     ax_b1.plot(t_history, dist_bound_history, 'k--', label=r'OCP Disturbance Bound $E_k$', linewidth=2)
     ax_b1.set_xlabel('Time (s)')
-    ax_b1.set_ylabel('Disturbance Norm')
+    ax_b1.set_ylabel('Acceleration Mismatch Norm')
     ax_b1.set_title('OCP-Derived Estimated Disturbance Bound vs True Disturbance')
     ax_b1.legend()
     ax_b1.grid(True)
-    
-    ax_b2.plot(t_history, state_err_history, 'm-', label=r'True State Est Error ||$\hat{x}$ - x||', linewidth=2)
-    ax_b2.plot(t_history, state_err_bound_history, 'k--', label=r'OCP State Est Bound $\bar{x}_m + \bar{x}_u$', linewidth=2)
-    ax_b2.set_xlabel('Time (s)')
-    ax_b2.set_ylabel('State Error Norm')
-    ax_b2.set_title('OCP-Derived State Estimation Bound vs True State Estimation Error')
-    ax_b2.legend()
-    ax_b2.grid(True)
-    
     fig_bounds.tight_layout()
     fig_bounds.savefig('ocp_bounds_vs_true.png', dpi=150, bbox_inches='tight')
     print("Plot saved to ocp_bounds_vs_true.png")
-
-    # --- 2D Animation Generation ---
-    fig_anim, ax_anim = plt.subplots(figsize=(6, 6))
-    ax_anim.set_xlim(-0.5, 3.0)
-    ax_anim.set_ylim(-0.5, 3.0)
-    ax_anim.set_aspect('equal')
-    ax_anim.set_title("2D Safe Navigation using CBF and OCP")
-    ax_anim.set_xlabel("X Position")
-    ax_anim.set_ylabel("Y Position")
-    ax_anim.grid(True)
-
-    # Draw Obstacle
-    obs_circle = plt.Circle((sys_controller.x_obs[0], sys_controller.x_obs[1]), sys_controller.d_safe, 
-                            color='red', alpha=0.3, label='Obstacle + Margin')
-    ax_anim.add_patch(obs_circle)
-    ax_anim.plot(sys_controller.x_obs[0], sys_controller.x_obs[1], 'rx', markersize=10, label='Obstacle Center')
-
-    # Draw Goal
-    ax_anim.plot(xd[0], xd[1], 'g*', markersize=15, label='Target Objective')
-
-    # Moving Elements
-    robot_line, = ax_anim.plot([], [], 'b-', alpha=0.6, label='Robot Trajectory')
-    robot_dot, = ax_anim.plot([], [], 'bo', markersize=8)
     
-    ax_anim.legend(loc='upper left')
-
-    def init_anim():
-        robot_line.set_data([], [])
-        robot_dot.set_data([], [])
-        return robot_line, robot_dot
-
-    def update_anim(frame):
-        # frame is the index in the history array
-        xs = x_history[:frame, 0]
-        ys = x_history[:frame, 1]
-        
-        robot_line.set_data(xs, ys)
-        
-        if frame > 0:
-            robot_dot.set_data([xs[-1]], [ys[-1]])
-            
-        return robot_line, robot_dot
-
-    # Set up animation
-    # Only animate a subset of frames if the simulation is very long, but 5.0s @ dt=0.1 is only 50 frames.
-    ani = animation.FuncAnimation(fig_anim, update_anim, frames=len(t_history),
-                                  init_func=init_anim, blit=True, interval=100) # 100ms per frame
-                                  
-    writer = animation.PillowWriter(fps=10, metadata=dict(artist='Antigravity'), bitrate=1800)
-    ani.save('scenario.gif', writer=writer)
-    print("Animation saved to scenario.gif")
+    # Validation Check
+    distances = np.linalg.norm(x_history[:,0:3] - sys_controller.x_obs, axis=1)
+    print(f"Minimum distance to obstacle center: {np.min(distances):.3f} (Constraint: {sys_controller.d_safe:.3f})")
 
 if __name__ == '__main__':
     main()

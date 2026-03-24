@@ -210,3 +210,6 @@ __marimo__/
 *.png
 *.gif
 .vscode/
+*.pdf
+*.pt
+*.txt
