@@ -51,32 +51,19 @@ class OCPBase:
 
 
 class DriftScoreOCP(OCPBase):
-    """
-    Computes the non-conformity score for model drift using Observer and Adaptation outputs.
-    Follows Eq (28) from the paper.
-    """
-    def compute_score(self, X: np.ndarray, Z: np.ndarray, theta_hat: np.ndarray) -> float:
-        """
-        Args:
-            X (np.ndarray): Current state differential or estimation from Observer.
-            Z (np.ndarray): Current regressor matrix from Observer.
-            theta_hat (np.ndarray): Current estimated parameters from Adaptation.
-            
-        Returns:
-            float: The non-conformity score S_k = ||X - Z \hat{\theta}||
-        """
-        # Ensure dimensions align for matrix multiplication
-        if theta_hat.ndim == 1:
-            theta_hat = theta_hat.reshape(-1, 1)
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
-            
-        # prediction: Z * \hat{\theta}
-        prediction = Z @ theta_hat
+    def get_dist_bound_from_quantile(self, q_k: float, T: float, L_d: float) -> float:
+        # Calculate peak assuming it's an isolated triangle
+        d_triangle = np.sqrt(2.0 * L_d * q_k)
         
-        # error norm ||X - Z\hat{\theta}||
-        S_k = np.linalg.norm(X - prediction)
-        return S_k
+        # Calculate the base width of that triangle
+        triangle_base = 2.0 * d_triangle / L_d
+        
+        # Apply the piecewise truncation logic
+        if triangle_base <= T:
+            d_bar = d_triangle
+        else:
+            d_bar = (q_k / T) + 0.5 * L_d * T
+        return d_bar
 
 class InnovationScoreOCP(OCPBase):
     """

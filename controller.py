@@ -266,11 +266,10 @@ class DynamicTubeMPC:
     Implements Dynamic Tube MPC (DTMPC) treating the tube geometry size (Phi) 
     and control bandwidth (alpha) as decision variables. Supports 3D Space and SSML DNN.
     """
-    def __init__(self, plant, x_obs: np.ndarray, d_safe: float, H: int = 5,
+    def __init__(self, plant, obstacles: list, H: int = 5,
                  dt: float = 0.1, eta: float = 0.1, T_horizon: float = 1.0):
         self.plant = plant
-        self.x_obs = x_obs
-        self.d_safe = d_safe
+        self.obstacles = obstacles # List of dicts {'pos': np.array([x,y,z]), 'r': radius}
         self.H = H
         self.dt = dt
         self.eta = eta
@@ -282,21 +281,23 @@ class DynamicTubeMPC:
         self.Phi = 0.1  # Initial tube size
 
     def compute_u(self, x: np.ndarray, xd: np.ndarray, 
-                  q_drift: float, model_nn=None) -> np.ndarray:
+                  q_drift: float, model_nn=None):
         import torch
         # Check divergence
         if np.any(np.isnan(x)):
-            return np.zeros(3)
+            return np.zeros(3), np.zeros((self.H, 8)), np.zeros(self.H), False
             
         disturbance_bound = q_drift / self.T_horizon
         
+        # For point-to-point, we start with a small tube centered on the drone
+        self.Phi = 0.1
+        
         # Evaluate Network Once for Zero-Order Hold Disturbance Prediction over the horizon
-        if model_nn is not None and x.shape[0] == 6:
-            # Assume initial hovering control for disturbance evaluation
-            x_in = np.concatenate((x, np.array([0, 0, 9.81 * self.plant.m])))
+        if model_nn is not None and x.shape[0] == 8:
+            # Assume hover state initial for disturbance evaluation
+            x_in = np.concatenate((x[3:6], x[6:8]))
             with torch.no_grad():
-                f_nn_initial = model_nn(torch.tensor(x_in, dtype=torch.float32)).numpy()
-            f_nn_acc = f_nn_initial[3:6]
+                f_nn_acc = model_nn(torch.tensor(x_in, dtype=torch.float32)).numpy()
         else:
             f_nn_acc = np.zeros(3)
 
@@ -305,20 +306,26 @@ class DynamicTubeMPC:
             V = OPT_flat[:3*self.H].reshape(self.H, 3)
             alphas = OPT_flat[3*self.H:]
             cost = 0.0
-            
             z = np.copy(x)
+            phi = self.Phi
             for j in range(self.H):
-                # Stage cost
-                cost += 50.0 * np.sum((z[:3] - xd[:3])**2) + 1.0 * np.sum((z[3:6] - xd[3:6])**2)
-                cost += 0.05 * np.sum(V[j]**2)
-                cost += 0.5 * (alphas[j])**2  # Penalize high bandwidth
-                    
-                z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V[j] + np.concatenate([np.zeros(3), f_nn_acc])
+                z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
                 z = z + z_dot * self.dt
+                phi = phi + self.dt * (-alphas[j] * phi + disturbance_bound + self.eta)
                 
-            # Terminal Cost
-            cost += 50.0 * np.sum((z[:3] - xd[:3])**2) + 5.0 * np.sum((z[3:6] - xd[3:6])**2)
+                # Stage cost
+                cost += 10.0 * np.sum((z[:3] - xd[:3])**2)
+                cost += 1.0 * np.sum(z[3:6]**2)   # Penalize linear velocity at each step
+                cost += 0.1 * np.sum(V[j]**2)
+                cost += 0.5 * phi**2
+
+            # Terminal Goal Cost
+            cost += 100.0 * np.sum((z[:3] - xd[:3])**2) + 50.0 * np.sum((z[3:6] - xd[3:6])**2)
             return cost
+
+        # Safety constraints for all obstacles
+        obs_positions = np.array([o['pos'] for o in self.obstacles])
+        obs_radii = np.array([o['r'] for o in self.obstacles])
 
         def constraints(OPT_flat):
             V = OPT_flat[:3*self.H].reshape(self.H, 3)
@@ -328,14 +335,12 @@ class DynamicTubeMPC:
             z = np.copy(x)
             phi = self.Phi
             for j in range(self.H):
-                # Obstacle constraint
-                dist = np.linalg.norm(z[0:3] - self.x_obs[0:3])
-                
-                # dist - d_safe - tube_radius >= 0
-                cons.append(dist - self.d_safe - phi)
+                # Vectorized distance to all obstacles
+                dists = np.linalg.norm(z[0:3] - obs_positions, axis=1)
+                cons.extend(dists - obs_radii - phi)
                 
                 # Step z
-                z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V[j] + np.concatenate([np.zeros(3), f_nn_acc])
+                z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
                 z = z + z_dot * self.dt
                 
                 # Step Phi
@@ -352,9 +357,12 @@ class DynamicTubeMPC:
         OPT_init[3*self.H:] = 1.0  # Initialize alphas to 1.0
         
         cons_dict = {'type': 'ineq', 'fun': constraints}
-        bnds = [(-self.u_max, self.u_max)] * (3 * self.H) + [(self.alpha_min, self.alpha_max)] * self.H
+        bnds = []
+        for _ in range(self.H):
+            bnds.extend([(-5.0, 5.0), (-5.0, 5.0), (0.0, 30.0)]) # Roll/Pitch rate bounds, Thrust bounds
+        bnds.extend([(self.alpha_min, self.alpha_max)] * self.H)
         
-        res = minimize(objective, OPT_init, method='SLSQP', bounds=bnds, constraints=cons_dict, options={'ftol': 1e-2, 'maxiter': 15})
+        res = minimize(objective, OPT_init, method='SLSQP', bounds=bnds, constraints=cons_dict, options={'ftol': 1e-2, 'maxiter': 20})
         
         if res.success or res.status == 4 or res.status == 8: # If reached iteration limit but found something
             V_opt = res.x[:3*self.H].reshape(self.H, 3)
@@ -367,15 +375,26 @@ class DynamicTubeMPC:
             self.Phi = self.Phi + self.dt * (-alphas_opt[0] * self.Phi + disturbance_bound + self.eta)
             
             if np.any(np.isnan(u_out)):
-                return np.zeros(3)
+                return np.zeros(3), np.zeros((self.H, 8)), np.zeros(self.H), False
             u_norm = np.linalg.norm(u_out)
             if u_norm > self.u_max:
-                u_out = (u_out / u_norm) * self.u_max
-            return u_out
+                u_out = u_out / u_norm * self.u_max
+                
+            # Compute full prediction horizon
+            z_pred = []
+            phi_pred = []
+            z = np.copy(x)
+            phi = self.Phi
+            for j in range(self.H):
+                z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V_opt[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
+                z = z + z_dot * self.dt
+                phi = phi + self.dt * (-alphas_opt[j] * phi + disturbance_bound + self.eta)
+                z_pred.append(np.copy(z))
+                phi_pred.append(phi)
+                
+            return u_out, np.array(z_pred), np.array(phi_pred), True
+            
+        # Fallback if solver fails
         else:
-            p_z = x[0:3]
-            p_obs = self.x_obs[0:3]
-            vec = p_z - p_obs
-            if np.linalg.norm(vec) > 1e-3:
-                vec = vec / np.linalg.norm(vec)
-            return 5.0 * vec
+            print("Solver failed")
+            return np.zeros(3), np.zeros((self.H, 8)), np.zeros(self.H), False

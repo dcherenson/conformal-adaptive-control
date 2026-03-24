@@ -9,12 +9,12 @@ from scipy.integrate import solve_ivp
 WEIGHTS_PATH = "ssml_weights.pt"
 
 # Define the SSML-AC Network Architecture
-# Use observer state and control as input: x_in = [p_hat(3), v_hat(3), u(3)]
-INPUT_DIM = 9
+# Use velocity and angles as input: x_in = [vx, vy, vz, phi, theta]
+INPUT_DIM = 5
 HIDDEN_DIM = 50
-# Output estimates additive dynamics mismatch for full observer dynamics:
-# [delta_p_dot(3), delta_v_dot(3)]
-OUTPUT_DIM = 6
+# Output estimates additive dynamics mismatch for acceleration/force directly:
+# [delta_v_dot(3)]
+OUTPUT_DIM = 3
 
 
 class SSMLNet(nn.Module):
@@ -46,31 +46,7 @@ def spectral_normalization_clip(model, v_max=10.0):
             param.data = param.data * (v_max / norm)
 
 
-# Quadcopter Dynamics (Simplified to Point-Mass for Position Tracking)
-class QuadcopterSim:
-    def __init__(self):
-        self.m = 1.0  # kg
-        self.g = np.array([0, 0, -9.81])
-
-    def wind_disturbance(self, t, p):
-        # Average intensity 1.0 m/s^2, highly dynamic
-        # Based on fans: varying sine waves.
-        d_x = 1.0 * np.sin(0.5 * t) + 0.5 * np.sin(2.0 * t) + 0.2 * np.random.randn()
-        d_y = 1.2 * np.cos(0.4 * t) + 0.6 * np.cos(1.8 * t) + 0.2 * np.random.randn()
-        d_z = 0.5 * np.sin(0.3 * t) + 0.1 * np.random.randn()
-        return np.array([d_x, d_y, d_z]) * self.m  # Force disturbance
-
-    def dynamics(self, t, state, u):
-        # state = [p_x, p_y, p_z, v_x, v_y, v_z]
-        p = state[0:3]
-        v = state[3:6]
-        d = self.wind_disturbance(t, p)
-
-        dp = v
-        # m a = m g + u + d
-        dv = self.g + (u + d) / self.m
-
-        return np.concatenate((dp, dv))
+from plant import Plant as QuadcopterSim
 
 
 # Generate Figure-8 Reference Trajectory
@@ -109,21 +85,26 @@ def collect_offline_data():
     Kd = np.diag([2.0, 2.0, 2.0])
 
     times = np.arange(0, t_end, dt)
-    state = np.zeros(6)
+    state = np.zeros(8) # 8D State: [px, py, pz, vx, vy, vz, phi, theta]
 
     data_x = []
     data_y = []
 
     for t in times:
-        u = nominal_pd_control(t, state, sim.m, Kp, Kd)
+        # Generate varied trajectory controls for p, q, T to explore states
+        p_u = 0.5 * np.sin(t)
+        q_u = 0.5 * np.cos(1.5 * t)
+        T_u = 9.81 * sim.m + 2.0 * np.sin(0.5 * t)
+        u = np.array([p_u, q_u, T_u])
+        
         d_true = sim.wind_disturbance(t, state[0:3])
 
-        # input x = [p, v, u]
-        x_in = np.concatenate((state[0:3], state[3:6], u))
+        # input x = [vx, vy, vz, phi, theta]
+        x_in = np.concatenate((state[3:6], state[6:8]))
 
-        # Target is additive mismatch on full state derivative:
-        # x_dot_true - x_dot_nominal = [0, d/m]
-        y_target = np.concatenate((np.zeros(3), d_true / sim.m))
+        # Target is additive mismatch on acceleration:
+        # v_dot_true - v_dot_nominal = d/m
+        y_target = d_true / sim.m
 
         data_x.append(x_in)
         data_y.append(y_target)
@@ -144,8 +125,8 @@ def train_ssml(data_x, data_y):
     Ha = 25  # Adaptation horizon
     Ht = 25  # Training horizon
 
-    alpha = 0.002
-    beta = 0.001
+    alpha = 0.05
+    beta = 0.01
     lambda_dir = 0.5
     lambda_norm = 0.05
 
@@ -187,8 +168,10 @@ def train_ssml(data_x, data_y):
             pred_a = model.relu(torch.nn.functional.linear(pred_a, fast_weights[4], fast_weights[5]))
             pred_a = torch.nn.functional.linear(pred_a, fast_weights[6], fast_weights[7])
 
-            loss_a = torch.sum((pred_a - Y_a) ** 2)
+            loss_a = torch.mean((pred_a - Y_a) ** 2)
             grads = torch.autograd.grad(loss_a, fast_weights, create_graph=True)
+            # Clip inner-loop gradients for stability
+            grads = [torch.clamp(g, -10.0, 10.0) for g in grads]
             fast_weights = [fw - alpha * g for fw, g in zip(fast_weights, grads)]
 
             # 2. Outer Loop: Prediction on Bt
@@ -196,11 +179,11 @@ def train_ssml(data_x, data_y):
             pred_t = model.relu(torch.nn.functional.linear(pred_t, fast_weights[2], fast_weights[3]))
             pred_t = model.relu(torch.nn.functional.linear(pred_t, fast_weights[4], fast_weights[5]))
             pred_t = torch.nn.functional.linear(pred_t, fast_weights[6], fast_weights[7])
-            loss_t_adapt = torch.sum((pred_t - Y_t) ** 2)
+            loss_t_adapt = torch.mean((pred_t - Y_t) ** 2)
 
             # Direct prediction loss
             pred_t_dir = model(X_t)
-            loss_t_dir = torch.sum((pred_t_dir - Y_t) ** 2)
+            loss_t_dir = torch.mean((pred_t_dir - Y_t) ** 2)
 
             meta_loss = loss_t_adapt + lambda_dir * loss_t_dir
             total_meta_loss += meta_loss
@@ -209,6 +192,7 @@ def train_ssml(data_x, data_y):
         total_meta_loss = total_meta_loss / num_tasks + lambda_norm * norm_penalty
 
         total_meta_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Apply layer spectral normalization (approximated by weight clipping)
@@ -263,6 +247,35 @@ def compute_jacobian(model, x_in):
         J_list.append(grad_flat)
 
     return torch.stack(J_list)
+
+
+def compute_ssml_input_lipschitz(model, x_in):
+    """
+    Computes the spectral norm of the Jacobian of the NN w.r.t its inputs (vx, vy, vz, phi, theta).
+    x_in = [vx, vy, vz, phi, theta]
+    Returns:
+        L_nn_x: Lipschitz constant w.r.t state (specifically velocity and angles)
+        L_nn_u: Lipschitz constant w.r.t control (0.0 since u is not an input)
+    """
+    model.eval()
+    x_tensor = torch.tensor(x_in, dtype=torch.float32).unsqueeze(0).requires_grad_(True)
+    
+    # Compute Jacobian w.r.t input
+    def model_forward(x):
+        return model(x)
+        
+    J = torch.autograd.functional.jacobian(model_forward, x_tensor)
+    # J shape: [1, OUTPUT_DIM, 1, INPUT_DIM] -> [3, 5]
+    J = J.view(OUTPUT_DIM, INPUT_DIM).detach().numpy()
+    
+    # Split into x and u parts
+    J_x = J[:, 0:5] # all inputs map to states now
+    
+    # Compute spectral norm (max singular value)
+    L_nn_x = np.linalg.norm(J_x, ord=2)
+    L_nn_u = 0.0 # Control is no longer an input to the DNN
+    
+    return L_nn_x, L_nn_u
 
 
 def run_online_ssml_ac(pretrained_model, baseline=False):
@@ -321,13 +334,13 @@ def run_online_ssml_ac(pretrained_model, baseline=False):
         if baseline:
             u = u_base
             f_nn_full = np.zeros(OUTPUT_DIM)
+            f_nn_acc = np.zeros(3)
         else:
-            x_in = np.concatenate((x_hat, u_base))
+            x_in = np.concatenate((x_hat[3:6], x_hat[6:8]))
             with torch.no_grad():
-                f_nn_full = model(torch.tensor(x_in, dtype=torch.float32)).numpy()
+                f_nn_acc = model(torch.tensor(x_in, dtype=torch.float32)).numpy()
 
             # Control compensation uses estimated acceleration mismatch only
-            f_nn_acc = f_nn_full[3:6]
             u = u_base - sim.m * f_nn_acc
 
             # Jacobian J = d f_nn / d theta, shape [OUTPUT_DIM x num_params]
@@ -348,7 +361,7 @@ def run_online_ssml_ac(pretrained_model, baseline=False):
         # Observer propagation uses only output innovation and model mismatch estimate
         innovation = y - C @ x_hat
         x_hat_dot_nom = np.concatenate((x_hat[3:6], sim.g + u / sim.m))
-        x_hat_dot = x_hat_dot_nom + f_nn_full + L @ innovation
+        x_hat_dot = x_hat_dot_nom + np.concatenate((np.zeros(3), f_nn_acc)) + L @ innovation
         x_hat = x_hat + x_hat_dot * dt
 
         trajectory_pos.append(p)
