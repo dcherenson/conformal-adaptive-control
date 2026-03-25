@@ -97,13 +97,19 @@ def collect_offline_data():
         T_u = 9.81 * sim.m + 2.0 * np.sin(0.5 * t)
         u = np.array([p_u, q_u, T_u])
         
-        d_true = sim.wind_disturbance(t, state[0:3])
+        # True disturbance includes velocity-dependent drag and angle coupling.
+        # The nominal model does NOT model these terms — only baseline wind.
+        # So the DNN target is the FULL true disturbance / m (residual to be learned).
+        v = state[3:6]
+        angles = state[6:8]
+        d_true = sim.wind_disturbance(t, state[0:3], v=v, angles=angles)
 
         # input x = [vx, vy, vz, phi, theta]
         x_in = np.concatenate((state[3:6], state[6:8]))
 
         # Target is additive mismatch on acceleration:
-        # v_dot_true - v_dot_nominal = d/m
+        # v_dot_true - v_dot_nominal = d_full/m
+        # (DNN learns the velocity/angle-dependent part since nominal captures only baseline wind)
         y_target = d_true / sim.m
 
         data_x.append(x_in)

@@ -323,9 +323,7 @@ class DynamicTubeMPC:
         n_opt   = n_V + n_alpha
 
         OPT = ca.SX.sym('OPT', n_opt)
-        # CasADi reshape is column-major; to match numpy row-major (step-first)
-        # we reshape as (3, H) then transpose -> V_sym[j,:] = [p_j, q_j, T_j]
-        V_sym     = ca.reshape(OPT[:n_V], 3, self.H).T
+        V_sym     = ca.reshape(OPT[:n_V], self.H, 3)
         alpha_sym = OPT[n_V:]
 
         # Numeric constants into CasADi
@@ -376,7 +374,7 @@ class DynamicTubeMPC:
             pos_err = z[:3] - xd_ca[:3]
             vel     = z[3:6]
             cost += 10.0 * ca.dot(pos_err, pos_err)
-            cost +=  5.0 * ca.dot(vel, vel)  # low penalty — terminal cost handles braking
+            cost +=  1.0 * ca.dot(vel, vel)
             cost +=  1.0 * ca.dot(Vj, Vj)
             cost +=  0.5 * phi**2
 
@@ -431,31 +429,14 @@ class DynamicTubeMPC:
             'ipopt.max_iter': 300,
             'ipopt.tol': 1e-3,
             'ipopt.constr_viol_tol': 1e-3,
-            'ipopt.acceptable_tol': 5e-2,
-            'ipopt.acceptable_constr_viol_tol': 5e-2,
-            'ipopt.acceptable_iter': 5,       # accept after 5 consecutive acceptable iters
-            'ipopt.mu_strategy': 'adaptive',  # better near non-convex constraint boundaries
-            'ipopt.nlp_scaling_method': 'gradient-based',
             'print_time': 0,
         }
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
+        sol = solver(x0=OPT_init,
+                     lbx=lbx, ubx=ubx,
+                     lbg=lbg, ubg=ubg)
 
-        def _cold_init():
-            """Default hover warm-start (no previous solution)."""
-            x0 = np.zeros(n_opt)
-            for j in range(self.H):
-                x0[j*3 + 2] = 9.81 * self.plant.m
-            x0[n_V:] = 1.0
-            return x0
-
-        sol = solver(x0=OPT_init, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg)
         stats = solver.stats()
-
-        # On Restoration_Failed the warm-start led to a bad iterate; retry cold.
-        if stats.get('return_status') == 'Restoration_Failed':
-            sol = solver(x0=_cold_init(), lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg)
-            stats = solver.stats()
-
         success = stats['success'] or stats['return_status'] in (
             'Solve_Succeeded', 'Solved_To_Acceptable_Level',
             'Maximum_Iterations_Exceeded')

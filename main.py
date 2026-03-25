@@ -27,30 +27,30 @@ def main():
     
     # Define Obstacles (Large+small pair creating narrow gap, small further along)
     obstacles = [
-        {'pos': np.array([3.0, -1.2, 1.0]), 'r': 0.8},  # Large obstacle, below path
-        {'pos': np.array([3.0,  0.7, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
-        {'pos': np.array([6.5,  0.0, 1.0]), 'r': 0.5},  # Small obstacle further along path
+        {'pos': np.array([3.0, -0.9, 1.0]), 'r': 0.7},  # Large obstacle, below path
+        {'pos': np.array([3.0,  0.5, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
+        {'pos': np.array([5.5,  0.0, 1.0]), 'r': 0.4},  # Small obstacle further along path
     ]
-    x_goal = np.array([8.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    x_goal = np.array([7.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    goal_radius = 0.3  # Goal region: sphere of this radius around x_goal (m)
 
     # Using DTMPC with full-state feedback and 3D Quadcopter
-    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=8, dt=dt)
+    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=30, dt=dt)
     
     # OCP for Drift bounds
     ocp_drift = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
 
     # SSML Network Initialization
     model = get_or_train_model()
-    sys_plant.spatial_mode = True  # Enable spatial distribution shift during runtime
     theta_0_flat = flatten_params(model).clone().detach()
     theta_flat = flatten_params(model).clone().detach()
     # Adaptation Parameters
 
-    gamma_lr = 0.2
+    gamma_lr = 0.0
     lambd = 0.1
 
     # State variables (8 elements: pos, vel, roll, pitch)
-    x = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # start at offset
+    x = np.array([-2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # start at offset
     u = np.array([0.0, 0.0, 9.81 * sys_plant.m])
     u_old = np.copy(u)
 
@@ -81,6 +81,10 @@ def main():
     tube_plotting = [sys_controller.Phi]
     theta_plotting = [theta_flat.detach().numpy().copy()]
     residual_plotting = [0.0]  # Initial residual is 0.0 before evaluating data
+
+    # Coverage Tracking
+    correct_bounds_count = 0
+    total_steps_count = 0
 
 
     print("Running SSML DTMPC 3D Flight Simulation...")
@@ -154,23 +158,32 @@ def main():
             
         q_drift = ocp_drift.update(S_drift)
 
-        # Lipschitz Estimation for discrepancy d(t)
-        # L_d = (Ltrue_x + Lnom_x + Lnn_x)*||xdot|| + (Ltrue_u + Lnom_u + Lnn_u)*||udot||
-        Lnn_x, Lnn_u = compute_ssml_input_lipschitz(model, x_in)
+        # 1. State-driven drift (Truth + NN lipschitz)
+        Lnn_x, _ = compute_ssml_input_lipschitz(model, x_in)
         norm_xdot = np.linalg.norm(x_dot_true)
-        norm_udot = np.linalg.norm((u - u_old) / dt)
+        L_d_spatial = (sys_plant.L_true_x + Lnn_x) * norm_xdot
+        # 2. Temporal drift (from time-varying wind in plant.py)
+        L_d_temporal = 1.0 # approx sum of (amplitude * omega) from sine terms
         
-        L_d = (sys_plant.L_true_x + sys_plant.L_nom_x + Lnn_x) * norm_xdot + \
-              (sys_plant.L_true_u + sys_plant.L_nom_u + Lnn_u) * norm_udot
+        # 3. Adaptation drift (how fast the model weights are changing)
+        # J = d f_nn / d theta, shape [3 x num_params]
+        J = compute_jacobian(model, x_in).detach().numpy()
+        # Adaptation rule: dot_theta = gamma * J^T * error_acc
+        grad_learning = np.linalg.norm(J.T @ error_acc) * gamma_lr
+        
+        L_d = L_d_spatial + L_d_temporal + grad_learning
         L_d = max(L_d, 0.1) # Minimum L_d to avoid zero bounds
         
         # Calculate new disturbance bound using triangle piece-wise logic
         # T is the window length (10 timesteps)
         dist_bound = ocp_drift.get_dist_bound_from_quantile(q_drift, T=T_window*dt, L_d=L_d)
 
+        # Track empirical coverage
+        total_steps_count += 1
+        if np.linalg.norm(error_acc) <= dist_bound:
+            correct_bounds_count += 1
+
         # Adaptation updates learns theta online
-        J = compute_jacobian(model, x_in).detach().numpy()
-        
         theta_dot = gamma_lr * np.dot(J.T, error_acc) - lambd * (
             theta_flat.detach().numpy() - theta_0_flat.numpy()
         )
@@ -202,10 +215,10 @@ def main():
                 print(f"COLLISION at t={t:.2f}s! Penetrated obstacle at {obs['pos']}")
                 stop_flag = True
                 break
-        # Stop when close enough to goal
+        # Stop when inside the goal region
         goal_dist = np.linalg.norm(x[:3] - x_goal[:3])
-        if goal_dist < 0.1:
-            print(f"Goal reached at t={t:.2f}s! Distance: {goal_dist:.3f}m")
+        if goal_dist < goal_radius:
+            print(f"Goal region reached at t={t:.2f}s! Distance: {goal_dist:.3f}m (radius: {goal_radius}m)")
             stop_flag = True
         if stop_flag:
             break
@@ -349,7 +362,7 @@ def main():
     # --- Top-Down Tube Plot ---
     fig_top, ax_top = plt.subplots(1, 1, figsize=(8, 8))
     # Plot Trajectory
-    ax_top.plot(xd_history[:, 0], xd_history[:, 1], 'k--', label='Reference Path', alpha=0.5)
+    ax_top.plot(xd_history[:, 0], xd_history[:, 1], 'k--', alpha=0.5)
     ax_top.plot(x_history[:, 0], x_history[:, 1], 'b-', label='Quadcopter Trajectory', linewidth=2)
     
     # Plot obstacles
@@ -393,13 +406,21 @@ def main():
         min_obs_dist = min(min_obs_dist, np.min(dists))
     print(f"Minimum distance to any obstacle surface: {min_obs_dist:.3f}")
 
+    # Empirical Coverage Report
+    if total_steps_count > 0:
+        coverage = correct_bounds_count / total_steps_count
+        print(f"\n--- Empirical Coverage Report ---")
+        print(f"Disturbance was correctly bounded {correct_bounds_count} out of {total_steps_count} times.")
+        print(f"Empirical Coverage: {coverage:.2%} (Target: {1-ocp_drift.alpha:.1%})")
+        print(f"----------------------------------\n")
+
     # --- Animation ---
     print("Generating Animation...")
     fig_anim = plt.figure(figsize=(8, 6))
     ax_anim = fig_anim.add_subplot(111, projection='3d')
     
     # Plot target trajectory
-    line_ref, = ax_anim.plot(xd_history[:, 0], xd_history[:, 1], xd_history[:, 2], label='Reference', color='orange', linestyle='--')
+    line_ref, = ax_anim.plot(xd_history[:, 0], xd_history[:, 1], xd_history[:, 2], color='orange', linestyle='--')
     line_true, = ax_anim.plot([], [], [], 'b-', label='Quadcopter Path', linewidth=2)
     scatter_true = ax_anim.scatter([], [], [], color='blue', s=50)
     
@@ -464,6 +485,62 @@ def main():
     ani = animation.FuncAnimation(fig_anim, update_graph, init_func=init, frames=len(x_history), interval=50, blit=False)
     ani.save('scenario.gif', writer='pillow', fps=20)
     print("Animation saved to scenario.gif")
+
+    # --- Top-Down 2D Animation ---
+    print("Generating top-down animation...")
+    fig_td = plt.figure(figsize=(8, 6))
+    ax_td = fig_td.add_subplot(111)
+    
+    # Plot target trajectory
+    line_ref_td, = ax_td.plot(xd_history[:, 0], xd_history[:, 1], color='orange', linestyle='--')
+    line_true_td, = ax_td.plot([], [], 'b-', label='Quadcopter Path', linewidth=2)
+    scatter_true_td = ax_td.scatter([], [], color='blue', s=50)
+    
+    line_pred_td, = ax_td.plot([], [], 'g--', label='MPC Prediction', linewidth=1)
+    scatter_pred_td = ax_td.scatter([], [], color='cyan', alpha=0.3, label='Tube Envelope')
+    
+    ax_td.scatter(x_goal[0], x_goal[1], color='gold', marker='*', s=100)
+    
+    def init_td():
+        line_true_td.set_data([], [])
+        scatter_true_td.set_offsets(np.empty((0, 2)))
+        line_pred_td.set_data([], [])
+        scatter_pred_td.set_offsets(np.empty((0, 2)))
+        return scatter_true_td, line_true_td, line_ref_td, line_pred_td, scatter_pred_td
+        
+    def update_graph_td(k):
+        scatter_true_td.set_offsets(np.column_stack((x_history[k:k+1, 0], x_history[k:k+1, 1])))
+        line_true_td.set_data(x_history[:k+1, 0], x_history[:k+1, 1])
+        
+        line_ref_td.set_data(xd_history[:k+1, 0], xd_history[:k+1, 1])
+        
+        # Update predicting horizon
+        line_pred_td.set_data(z_pred_hist[k, :, 0], z_pred_hist[k, :, 1])
+        
+        scatter_pred_td.set_offsets(np.column_stack((z_pred_hist[k, :, 0], z_pred_hist[k, :, 1])))
+        # scale scatter size dynamically from tube bound phi
+        scatter_pred_td.set_sizes((phi_pred_hist[k] * 100) ** 2)
+
+        ax_td.set_title(rf'DTMPC Top-Down Flight | Time: {t_history[k]:.1f}s | $\Phi$: {tube_history[k]:.2f}m')
+        return scatter_true_td, line_true_td, line_ref_td, line_pred_td, scatter_pred_td
+
+    # Draw spherical obstacles (as 2D circles)
+    for obs in obstacles:
+        circ = plt.Circle((obs['pos'][0], obs['pos'][1]), obs['r'], color='red', alpha=1.0)
+        ax_td.add_patch(circ)
+        
+    x_lo, x_hi = np.min(x_history[:,0])-0.5, np.max(x_history[:,0])+0.5
+    y_lo, y_hi = -2.5, 2.5
+    ax_td.set_xlim([x_lo, x_hi])
+    ax_td.set_ylim([y_lo, y_hi])
+    ax_td.set_aspect('equal')
+    ax_td.set_xlabel('X')
+    ax_td.set_ylabel('Y')
+    ax_td.legend()
+    
+    ani_td = animation.FuncAnimation(fig_td, update_graph_td, init_func=init_td, frames=len(x_history), interval=50, blit=False)
+    ani_td.save('scenario_topdown.gif', writer='pillow', fps=20)
+    print("Top-down animation saved to scenario_topdown.gif")
 
 if __name__ == '__main__':
     main()
