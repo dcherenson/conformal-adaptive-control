@@ -126,140 +126,6 @@ class SafetyCriticalController:
             raise RuntimeError(f"QP Infeasible at xhat={xhat}, margin_lin={margin_lin:.4f}")
 
 
-class RobustTubeMPC:
-    """
-    Implements the Dual-Conformal Robust Tube MPC (Theorem 4).
-    Dynamically bounds uncertainty tubes using OCP parameters and tightens 
-    predictive geometry over the horizon H.
-    """
-    def __init__(self, plant: Plant, x_obs: np.ndarray, d_safe: float, H: int = 5,
-                 dt: float = 0.1, epsilon_bar: float = 0.1, C_m_min_sv: float = 1.0, 
-                 T_horizon: float = 1.0):
-        self.plant = plant
-        self.x_obs = x_obs
-        self.d_safe = d_safe
-        self.H = H
-        self.dt = dt
-        
-        # OCP Mapping parameters
-        self.epsilon_bar = epsilon_bar
-        self.C_m_min_sv = C_m_min_sv
-        self.T_horizon = T_horizon
-        
-        # Ancillary controller gain K for the pointmass (Double Integrator LQR proxy)
-        # u = v + K(xhat - z)
-        # K needs to be stabilizing for A_cl = A + BK. We use a simple PD structure.
-        self.Kp = 4.0
-        self.Kd = 2.0
-        # A_cl mapped continuous bounds: A_cl limits tracking error
-        self.u_max = 10.0 # Bounding input capability
-        self.A_cl_op_norm = 0.90 # Approximation of strict contractive decay for error bounds
-
-    def compute_u(self, xhat: np.ndarray, theta_hat: np.ndarray, xd: np.ndarray, 
-                  q_drift: float, q_inn: float) -> np.ndarray:
-        """
-        Solves the Optimal Control Problem (OCP) sequence v_{0..H-1} and returns u_0.
-        """
-        # 0. Sanity Check for Divergence
-        if np.any(np.isnan(xhat)) or np.any(np.isnan(theta_hat)):
-            return np.zeros(2)
-            
-        # 1. Compute Data-Driven Uncertainty Bounds
-        x_bar_m = (q_inn + self.epsilon_bar) / self.C_m_min_sv
-        x_bar_u = q_drift
-        initial_error_bound = x_bar_m + x_bar_u
-        disturbance_bound = q_drift / self.T_horizon
-        
-        # Calculate the cumulative Minkowski cross-section constants upfront
-        # radius_{j|k} = ||A_cl||^j * ||xhat_k - z_0|| + ||A_cl||^j*E_x + sum_0^{j-1} ||A_cl||^i * E_k
-        # Since we lock z_0 = xhat_k for simplicty on the first step, ||xhat_k - z_0|| = 0.
-        tube_radii = np.zeros(self.H + 1)
-        for j in range(self.H + 1):
-            tube_radii[j] = initial_error_bound * (self.A_cl_op_norm**j)
-            if j > 0:
-                dist_sum = sum((self.A_cl_op_norm**i) * disturbance_bound for i in range(j))
-                tube_radii[j] += dist_sum
-            # Cap the radius to prevent optimization blowup under extreme uncertainty
-            tube_radii[j] = min(tube_radii[j], 10.0)
-                
-        # 2. Formulate the finite horizon SLSQP Nonlinear problem
-        # We need to optimize the virtual control sequence v_0...v_{H-1}
-        # Dimensions: H vectors of shape (2,) -> flat array of size 2*H
-        
-        def objective(V_flat):
-            V = V_flat.reshape(self.H, 2)
-            cost = 0.0
-            
-            # Forward propagate virtual dynamics z
-            # We assume initial virtual state z_0 equals the current observer state
-            z = np.copy(xhat)
-            for j in range(self.H):
-                # Quadratic stage cost ||z_j - x_ref||^2_Q + ||v_j||^2_R
-                cost += 50.0 * np.sum((z[:2] - xd[:2])**2) + 1.0 * np.sum((z[2:] - xd[2:])**2) + 0.05 * np.sum(V[j]**2)
-                
-                # Next virtual state z_{j+1} using true estimated physics
-                # z_dot = f(z) + g(z)v + F(z)theta_hat
-                z_dot = self.plant.f(z) + self.plant.g(z) @ V[j] + self.plant.F(z) @ theta_hat
-                z = z + z_dot * self.dt
-            
-            # Terminal Cost ||z_H - x_ref||^2_P
-            cost += 50.0 * np.sum((z[:2] - xd[:2])**2) + 5.0 * np.sum((z[2:] - xd[2:])**2)
-            return cost
-
-        def constraints(V_flat):
-            V = V_flat.reshape(self.H, 2)
-            # Inequality constraints (must be >= 0)
-            cons = []
-            
-            z = np.copy(xhat)
-            for j in range(self.H):
-                # Apply the Pontryagin strict tracking subtraction
-                # z_j \in S \ominus \Omega_{j|k}
-                # This translates to: ||p_z - p_obs|| >= d_safe + radius_j
-                p_z = np.array([z[0], z[1]])
-                p_obs = np.array([self.x_obs[0], self.x_obs[1]])
-                dist = np.linalg.norm(p_z - p_obs)
-                
-                # Constraint: dist - d_safe - tube_radii[j] >= 0
-                cons.append(dist - self.d_safe - tube_radii[j])
-                
-                # Step z
-                z_dot = self.plant.f(z) + self.plant.g(z) @ V[j] + self.plant.F(z) @ theta_hat
-                z = z + z_dot * self.dt
-                
-            return np.array(cons)
-
-        # 3. Solve the optimization
-        from scipy.optimize import minimize
-        V_init = np.zeros(2 * self.H) # Guess zero control
-        cons_dict = {'type': 'ineq', 'fun': constraints}
-        bnds = [(-self.u_max, self.u_max)] * (2 * self.H)
-        
-        res = minimize(objective, V_init, method='SLSQP', bounds=bnds, constraints=cons_dict, options={'ftol': 1e-4, 'maxiter': 50})
-        
-        # 4. Apply resulting control law: u = v_0* + K(xhat - z_0)
-        # Since we enforced z_0 = xhat, the proportional tracking error is 0. u = v_0*
-        if res.success:
-            V_opt = res.x.reshape(self.H, 2)
-            u_out = V_opt[0]
-            # Double check for NaN before returning
-            if np.any(np.isnan(u_out)):
-                return np.zeros(2)
-            # Clip to actuator limits
-            u_norm = np.linalg.norm(u_out)
-            if u_norm > self.u_max:
-                u_out = (u_out / u_norm) * self.u_max
-            return u_out
-        else:
-            # Fallback if infeasible: apply max braking
-            p_x = xhat[0]
-            p_y = xhat[1]
-            obs_x = self.x_obs[0]
-            obs_y = self.x_obs[1]
-            vec = np.array([p_x - obs_x, p_y - obs_y])
-            if np.linalg.norm(vec) > 1e-3:
-                vec = vec / np.linalg.norm(vec)
-            return 5.0 * vec
 
 class DynamicTubeMPC:
     """
@@ -396,6 +262,12 @@ class DynamicTubeMPC:
         cost += 100.0 * ca.dot(pos_err_f, pos_err_f)
         cost +=  50.0 * ca.dot(vel_f, vel_f)
 
+        # Terminal Velocity Hard Constraints (Equality)
+        num_ineq = len(g_sym)
+        g_sym.append(z[3] - xd_ca[3])
+        g_sym.append(z[4] - xd_ca[4])
+        g_sym.append(z[5] - xd_ca[5])
+
         g_ca = ca.vertcat(*g_sym)
 
         # Bounds
@@ -408,7 +280,9 @@ class DynamicTubeMPC:
         ubx += [self.alpha_max] * self.H
 
         lbg = [0.0] * g_ca.shape[0]
-        ubg = [ca.inf] * g_ca.shape[0]
+        # Inequality constraints are (>= 0), so ubg = inf
+        # Terminal velocity constraints are (== 0), so ubg = 0
+        ubg = [ca.inf] * num_ineq + [0.0] * 3
 
         # Warm-start
         if self._prev_opt is not None:

@@ -64,19 +64,3 @@ class DriftScoreOCP(OCPBase):
         else:
             d_bar = (q_k / T) + 0.5 * L_d * T
         return d_bar
-
-class InnovationScoreOCP(OCPBase):
-    """
-    Computes the non-conformity score for measurement innovation (Sensor vs Observer).
-    """
-    def compute_score(self, y: np.ndarray, y_hat: np.ndarray) -> float:
-        """
-        Args:
-            y (np.ndarray): Actual sensor measurement.
-            y_hat (np.ndarray): Predicted measurement from Observer (C * \hat{x}).
-            
-        Returns:
-            float: The innovation non-conformity score S_k = ||y - \hat{y}||
-        """
-        S_k = np.linalg.norm(y - y_hat)
-        return S_k
