@@ -27,46 +27,44 @@ class Plant:
         self.L_true_x = 1.5  # accounts for drag + angle-coupling terms
         self.L_true_u = 1.0 / self.m
 
-    def wind_disturbance(self, t, p, v=None, angles=None):
-        """True disturbance: time-varying wind + spatial gradient + velocity drag + angle coupling.
-
-        The nominal model does NOT include the velocity/angle terms — those are the
-        residuals the DNN is trained to capture.
-
-        Args:
-            t:      simulation time (s)
-            p:      position [px, py, pz]
-            v:      velocity [vx, vy, vz] (None → zero contribution)
-            angles: [phi, theta] in radians (None → zero contribution)
-        Returns:
-            Force disturbance vector [Fx, Fy, Fz] in Newtons.
-        """
-        # ── Nominal part: time-varying wind (same as nominal model knows about) ──
-        d_x = 1.0 * np.sin(0.5 * t) + 0.5 * np.sin(2.0 * t) + 0.2 * np.random.randn()
-        d_y = 1.2 * np.cos(0.4 * t) + 0.6 * np.cos(1.8 * t) + 0.2 * np.random.randn()
-        d_z = 0.5 * np.sin(0.3 * t) + 0.1 * np.random.randn()
-
-        # Spatial gradient (position-dependent shift)
+    def wind_velocity(self, t, p):
+        v_wind_x = 2.0 * np.sin(0.5 * t) + 1.0 * np.sin(2.0 * t)
+        v_wind_y = 2.4 * np.cos(0.4 * t) + 1.2 * np.cos(1.8 * t)
+        v_wind_z = 1.0 * np.sin(0.3 * t)
+        
         if self.spatial_mode:
-            d_x += 1.0 * p[0]
-            d_y += 1.0 * p[1]
-            d_z += 0.5 * p[2]
+            v_wind_x += 0.5 * p[0]
+            v_wind_y += 0.5 * p[1]
+            v_wind_z += 0.2 * p[2]
+            
+        return np.array([v_wind_x, v_wind_y, v_wind_z])
 
-        d = np.array([d_x, d_y, d_z]) * self.m  # Base force disturbance
-
-        # ── Residual part: NOT in nominal model, DNN must learn this ───────────
-        if v is not None:
-            # Velocity-dependent aerodynamic drag: F_drag = -k_drag * v
-            v = np.asarray(v)
-            d -= self.k_drag * v * self.m
-
-        if angles is not None:
-            # Angle-dependent lateral coupling: tilted body channels disturbance
-            phi, theta = angles[0], angles[1]
-            d[0] += self.k_angle * np.sin(phi) * self.m
-            d[1] += self.k_angle * np.sin(theta) * self.m
-
-        return d
+    def unmodeled_dynamics(self, t, p, v, angles):
+        """Realistic unmodeled drag using body-frame relative velocity."""
+        phi, theta = angles
+        v_wind = self.wind_velocity(t, p)
+        v_rel = v - v_wind
+        
+        # Rotation matrix R_X(phi) @ R_Y(theta) from body to world
+        cx, sx = np.cos(phi), np.sin(phi)
+        cy, sy = np.cos(theta), np.sin(theta)
+        R = np.array([
+            [cy, 0, sy],
+            [sx*sy, cx, -sx*cy],
+            [-cx*sy, sx, cx*cy]
+        ])
+        
+        v_b = R.T @ v_rel
+        # Body frame quadratic drag coefficients
+        D_body = np.diag([0.3, 0.3, 0.6]) # Higher drag vertically due to rotors
+        
+        # Drag force in world frame: F = - R * D * (v_b * |v_b|)
+        drag_force = -self.m * R @ D_body @ (v_b * np.abs(v_b))
+        
+        # Additive noise
+        noise = np.random.randn(3) * np.array([0.2, 0.2, 0.1])
+        
+        return drag_force + noise
 
     def f(self, x: np.ndarray) -> np.ndarray:
         # Expected nominal drift dynamics [dp, dv, dAngles] where dv = g
@@ -96,7 +94,7 @@ class Plant:
 
     def Delta(self, x: np.ndarray, t: float) -> np.ndarray:
         """Full-state additive mismatch (true - nominal), including vel/angle terms."""
-        d = self.wind_disturbance(t, x[0:3], v=x[3:6], angles=x[6:8])
+        d = self.unmodeled_dynamics(t, x[0:3], x[3:6], x[6:8])
         return np.concatenate((np.zeros(3), d / self.m))
 
     def dynamics(self, t, state, u):
@@ -108,7 +106,7 @@ class Plant:
         phi, theta = angles
 
         # True disturbance depends on velocity and body angles
-        d = self.wind_disturbance(t, p, v=v, angles=angles)
+        d = self.unmodeled_dynamics(t, p, v, angles)
 
         dp = v
         # m a = m g + R * T + d

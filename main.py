@@ -14,20 +14,22 @@ from controller import DynamicTubeMPC
 from ssml import get_or_train_model, flatten_params, assign_params, compute_jacobian, compute_ssml_input_lipschitz, spectral_normalization_clip, get_reference
 
 def main():
-    np.random.seed(42)
-    torch.manual_seed(42)
+    np.random.seed(1337)
+    torch.manual_seed(1337)
 
     # Simulation Variables
     t = 0.0
-    dt = 0.05   # slightly coarser than ssml.py to ensure 3D MPC completes in reasonable time (H=8 becomes 0.4s horizon)
-    t_end = 5.0  # Point-to-point navigation time
+    dt_sim = 0.01
+    dt_mpc = 0.05
+    n_substeps = int(dt_mpc / dt_sim) # 5
+    t_end = 10.0  # Point-to-point navigation time
 
     # Initialize Architecture Components
     sys_plant = Plant(spatial_mode=True)
     
     # Define Obstacles (Large+small pair creating narrow gap, small further along)
     obstacles = [
-        {'pos': np.array([3.0, 0.5, 1.0]), 'r': 0.7},  # Large obstacle, below path
+        {'pos': np.array([3.0, 0.4, 1.0]), 'r': 0.7},  # Large obstacle, below path
         {'pos': np.array([3.0,  -0.9, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
         {'pos': np.array([5.5,  0.0, 1.0]), 'r': 0.4},  # Small obstacle further along path
     ]
@@ -36,11 +38,11 @@ def main():
 
     # Using DTMPC with full-state feedback and 3D Quadcopter
     mpc_horizon = 10
-    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=mpc_horizon, dt=dt)
+    sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=mpc_horizon, dt=dt_mpc)
     
     # OCP for Drift bounds
-    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=1.0)
-    ocp_derivative = DriftScoreOCP(alpha=0.1, eta_const=1.0, q_init=10.0)
+    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
+    ddot_bound = 3.0
 
     # SSML Network Initialization
     model = get_or_train_model()
@@ -66,21 +68,18 @@ def main():
     
     theta_history_norm = [0.0]
     
-    # Rolling Windows (10 time steps long)
+    # Rolling Windows (Maintain same physical time window as before: 0.5s)
     import collections
-    T_window = mpc_horizon
+    T_window = int(mpc_horizon * dt_mpc / dt_sim) # 50 steps at 100 Hz
     past_states = collections.deque(maxlen=T_window)
     past_f_nom = collections.deque(maxlen=T_window)
     past_v = collections.deque(maxlen=T_window)
+    past_theta_dot_norm = collections.deque(maxlen=T_window)
     
     # OCP Tracking
     drift_scores_I = [0.0]
-    drift_scores_D = [0.0]
     drift_quantiles_I = [ocp_integral.get_quantile()]
-    drift_quantiles_D = [ocp_derivative.get_quantile()]
-    dist_bound_plotting = [0.1] # Initial guess for plotter
-    error_acc_history = []
-    true_deriv_plotting = [0.0]
+    dist_bound_plotting = [ocp_integral.get_quantile()]
 
     # Target plotting
     xd_plotting = []
@@ -95,26 +94,45 @@ def main():
 
 
     print("Running SSML DTMPC 3D Flight Simulation...")
+    mpc_step_counter = 0
+    theta_dot_norm_val = 0.0 # Initial adaptation rate
 
     # Simulation Loop
+    xd = x_goal
+    t_sim_block_start = time.time()
     while t <= t_end:
         t_start = time.time()
-        # Point-to-Point Goal
-        xd = x_goal
-        # Controller computes 3D control force and prediction horizon
-        u_old = np.copy(u)
-        u, z_pred, phi_pred, success = sys_controller.compute_u(x, xd, dist_bound_plotting[-1], model_nn=model)
-        if not success:
-            print(f"Solver failed at t={t:.2f}s! Ending simulation early.")
-            break
-        z_pred_plotting.append(z_pred)
-        phi_pred_plotting.append(phi_pred)
-        xd_plotting.append(np.copy(xd))
+        # 1. Update MPC at 20 Hz
+        if int(t/dt_sim + 0.5) % n_substeps == 0:
+            mpc_step_counter += 1
+            # Controller computes 3D control force and prediction horizon
+            u_old_mpc = np.copy(u) # store for possible reference
+            t_solve_start = time.time()
+            u, z_pred, phi_pred, success = sys_controller.compute_u(x, xd, dist_bound_plotting[-1], model_nn=model)
+            solve_time = time.time() - t_solve_start
+            
+            if mpc_step_counter % 10 == 0:
+                 t_now = time.time()
+                 sim_block_time = t_now - t_sim_block_start
+                 print(f"t: {t:.2f}s | MPC Solve: {solve_time:.4f}s | Last 50 steps: {sim_block_time:.4f}s")
+                 t_sim_block_start = t_now
+
+            if not success:
+                print(f"Solver failed at t={t:.2f}s! Ending simulation early.")
+                break
+            z_pred_plotting.append(z_pred)
+            phi_pred_plotting.append(phi_pred)
+            xd_plotting.append(np.copy(xd))
+        else:
+            # Maintain previous MPC outputs for plotting to keep lengths consistent
+            z_pred_plotting.append(z_pred_plotting[-1])
+            phi_pred_plotting.append(phi_pred_plotting[-1])
+            xd_plotting.append(xd_plotting[-1])
 
         x_old = np.copy(x)
 
-        # Plant integrates one step forward with true wind disturbance
-        x = sys_plant.step(x_old, u, t, dt)
+        # 2. Plant integrates one step forward at 100 Hz
+        x = sys_plant.step(x_old, u, t, dt_sim)
 
         # Neural Network prediction
         x_in = np.concatenate((x_old[3:6], x_old[6:8]))
@@ -129,7 +147,7 @@ def main():
         error_acc_true = (x_dot_true - x_dot_pred)[3:6]
         
         # Finite difference acceleration mismatch for adaptation and OCP (observable)
-        v_dot_est = (x[3:6] - x_old[3:6]) / dt
+        v_dot_est = (x[3:6] - x_old[3:6]) / dt_sim
         error_acc = v_dot_est - x_dot_pred[3:6]
         
         # Compute predicted full-state derivative v_current = x_dot_pred
@@ -139,11 +157,12 @@ def main():
         past_states.append(np.copy(x_old))
         past_f_nom.append(np.copy(x_dot_pred))
         past_v.append(np.copy(v_current))
+        past_theta_dot_norm.append(theta_dot_norm_val)
 
         L = len(past_states)
         S_I = 0.0 # Integral Score (Size)
-        S_D = 0.0 # Derivative Score (Speed)
-        dist_bound = 0.1 # Default initialization
+        norm_theta_dot = 0.0 # Supremum of theta_dot norm over interval
+
         
         if L > 1:
             x_buffer = np.array(past_states)
@@ -160,7 +179,7 @@ def main():
             x_rev = np.flip(x_buffer, axis=0)
             
             # 1b. Compute the backward integrals using a cumulative sum
-            integrals_rev = np.cumsum(f_nom_rev, axis=0) * dt
+            integrals_rev = np.cumsum(f_nom_rev, axis=0) * dt_sim
             
             # 1c. Compute the full state prediction error for all sub-intervals ending at t_k
             prediction_errors = x_k - x_rev - integrals_rev
@@ -169,48 +188,22 @@ def main():
             error_norms = np.linalg.norm(prediction_errors, axis=1)
             S_I = np.max(error_norms)
             
+            # 1e. Extract supremum of theta_dot norm over the SAME sub-interval
+            idx_max = np.argmax(error_norms)
+            h_best = idx_max # Length of interval (0-indexed index in rev is length)
+            # prediction_errors[idx_max] corresponds to x_rev[idx_max] = x_buffer[L-1-idx_max]
+            # The interval is x_buffer[L-1-idx_max] to x_buffer[L-1]
+            theta_dot_buffer = np.array(past_theta_dot_norm)
+            if h_best > 0:
+                norm_theta_dot = np.max(theta_dot_buffer[-h_best:])
+            else:
+                norm_theta_dot = 0.0
+            
             # Update the Integral Quantile
             q_I = ocp_integral.update(S_I)
-            
-            # ==========================================================
-            # 2. DERIVATIVE OCP (Tracking the Speed of the Disturbance)
-            # ==========================================================
-            # Require enough history to cleanly split the window in half
-            # if L >= 4:
-            #     # 2a. Define the half-window boundaries
-            #     N_w = L // 2       # Number of discrete steps in half the window
-            #     w_time = N_w * dt  # Physical time duration of half the window
-                
-            #     # Extract the three critical state endpoints
-            #     x_past   = x_buffer[0]    # Oldest state: x(t - H)
-            #     x_mid    = x_buffer[N_w]  # Middle state: x(t - w)
-            #     x_present = x_k           # Current state: x(t)
-                
-            #     # 2b. Integrate the nominal model over the two halves
-            #     # (np.sum across the discrete steps * dt acts as a fast Euler integral)
-            #     integral_past   = np.sum(f_nom_buffer[0:N_w], axis=0) * dt
-            #     integral_present = np.sum(f_nom_buffer[N_w:], axis=0) * dt
-                
-            #     # 2c. Compute the accumulated physical disturbance (E) in each half
-            #     E_1 = (x_mid - x_past) - integral_past
-            #     E_2 = (x_present - x_mid) - integral_present
-                
-            #     # 2d. Compute the Macroscopic Derivative Score
-            #     S_D = (1.0 / (w_time**2)) * np.linalg.norm(E_2 - E_1)
-                
-            #     # Update the Derivative Quantile
-            #     q_D = 5.0#ocp_derivative.update(S_D)
-                
-            #     # ==========================================================
-            #     # 3. SYNTHESIZE THE DUAL ROBUSTNESS MARGIN
-            #     # ==========================================================
-            #     dist_bound = np.sqrt(2.0 * q_D * q_I)
-                
-            # else:
-                # Fallback for the first few timesteps while the buffer fills
-            q_I = ocp_integral.get_quantile()
-            q_D = 5.0#ocp_derivative.get_quantile()
-            dist_bound = np.sqrt(2.0 * q_D * q_I) 
+            dist_bound = np.sqrt(2.0 * ddot_bound * q_I)
+        else:
+            dist_bound = np.sqrt(2.0 * ddot_bound * ocp_integral.get_quantile())
 
         # Compute Lipschitz constant L_d for plotting
         L_d, _ = compute_ssml_input_lipschitz(model, x_in)
@@ -225,11 +218,12 @@ def main():
         if np.linalg.norm(error_acc_true) <= dist_bound:
             correct_bounds_count += 1
 
-        # Adaptation updates learns theta online
+        # Adaptation updates learns theta online (at 100 Hz)
         theta_dot = gamma_lr * np.dot(J.T, error_acc) - lambd * (
             theta_flat.detach().numpy() - theta_0_flat.numpy()
         )
-        theta_flat = theta_flat + torch.tensor(theta_dot, dtype=torch.float32) * dt
+        theta_flat = theta_flat + torch.tensor(theta_dot, dtype=torch.float32) * dt_sim
+        theta_dot_norm_val = np.linalg.norm(theta_dot)
         
         assign_params(model, theta_flat)
         spectral_normalization_clip(model)
@@ -237,28 +231,18 @@ def main():
         param_change = np.linalg.norm(theta_flat.detach().numpy() - theta_0_flat.numpy())
         theta_history_norm.append(param_change)
 
-        # Append variables for graphing
-        t += dt
-        u_old = np.copy(u)
+        # Append variables for graphing (at 100 Hz)
+        t += dt_sim
+        # u_old = np.copy(u) # already handled at loop top if needed
         x_plotting.append(np.copy(x))
         t_plotting.append(t)
         drift_scores_I.append(S_I)
-        drift_scores_D.append(S_D)
         drift_quantiles_I.append(ocp_integral.get_quantile())
-        drift_quantiles_D.append(ocp_derivative.get_quantile())
         dist_bound_plotting.append(dist_bound)
         tube_plotting.append(sys_controller.Phi)
         theta_plotting.append(theta_flat.detach().numpy().copy())
         residual_plotting.append(np.linalg.norm(error_acc_true))
         Ld_plotting.append(L_d)
-        
-        # True derivative of disturbance (finite differencing on truth for monitoring)
-        error_acc_history.append(np.copy(error_acc_true))
-        if len(error_acc_history) > 1:
-            deriv = np.linalg.norm(error_acc_history[-1] - error_acc_history[-2]) / dt
-            true_deriv_plotting.append(deriv)
-        else:
-            true_deriv_plotting.append(0.0)
 
         # Collision check
         stop_flag = False
@@ -275,11 +259,6 @@ def main():
         if stop_flag:
             break
 
-        # every 10 time steps, print out how long it took the run the loop
-        t_end_timer = time.time()
-        if int(t/dt) % 10 == 0:
-            print(f"t: {t:.2f}, 10 steps took {t_end_timer - t_start:.4f} seconds")
-            # print(f"t: {t:.2f}, x: {x[0]:.2f}, {x[1]:.2f}, {x[2]:.2f}, v: {x[3]:.2f}, {x[4]:.2f}, {x[5]:.2f}, u: {u[0]:.2f}, {u[1]:.2f}, {u[2]:.2f}, S_drift: {S_drift:.2f}, q_drift: {q_drift:.2f}, dist_bound: {dist_bound_plotting[-1]:.2f}")
 
     # Append terminal target since while loop offsets it by 1
     xd_plotting.append(np.copy(x_goal))
@@ -292,10 +271,7 @@ def main():
     phi_pred_hist = np.array(phi_pred_plotting)
     dist_bound_history = np.array(dist_bound_plotting)
     drift_scores_I = np.array(drift_scores_I)
-    drift_scores_D = np.array(drift_scores_D)
     drift_quantiles_I = np.array(drift_quantiles_I)
-    drift_quantiles_D = np.array(drift_quantiles_D)
-    true_deriv_history = np.array(true_deriv_plotting)
 
     # Subplots
     fig, (ax1, ax5) = plt.subplots(2, 1, figsize=(10, 10))
@@ -316,14 +292,9 @@ def main():
     # Plot Drift Score vs Quantile
     ax5.plot(t_history, drift_scores_I, 'c-', label='Integral Score $S_{I,k}$', linewidth=2, alpha=0.5)
     ax5.plot(t_history, drift_quantiles_I, 'c--', label='Integral Quantile $q_{I,k}$', linewidth=2)
-    ax5.plot(t_history, drift_scores_D, 'm-', label='Derivative Score $S_{D,k}$', linewidth=2, alpha=0.5)
-    ax5.plot(t_history, drift_quantiles_D, 'm--', label='Derivative Quantile $q_{D,k}$', linewidth=2)
     ax5.set_xlabel('Time (s)')
     ax5.set_ylabel('Value')
-    ax5.set_title('Neural Acceleration Dual OCP (Area + Speed)')
-    ax5.legend()
-    ax5.grid(True)
-    
+    ax5.set_title('Neural Acceleration OCP (Integral Score)')
     ax5.legend()
     ax5.grid(True)
 
@@ -369,24 +340,14 @@ def main():
 
     # --- Unified OCP Bounds & Residuals Plot ---
     residual_history = np.array(residual_plotting)
-    fig_bounds, (ax_b1, ax_b2) = plt.subplots(2, 1, figsize=(10, 10))
+    fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 5))
     ax_b1.plot(t_history, residual_history, 'r-', label=r'Instantaneous Residual $\|\tilde F + \delta\|$', alpha=0.6)
     ax_b1.plot(t_history, dist_bound_history, 'k--', label=r'OCP Disturbance Bound $E_k$', linewidth=2)
     ax_b1.set_xlabel('Time (s)')
     ax_b1.set_ylabel('Dynamics Mismatch (m/s^2)')
-    ax_b1.set_title('Unified OCP Bounds, Drift Scores, and Dynamics Residuals')
+    ax_b1.set_title('Unified OCP Bounds and Dynamics Residuals')
     ax_b1.legend()
     ax_b1.grid(True)
-    
-    # Plot Derivative Comparison
-    ax_b2.plot(t_history, true_deriv_history, 'r-', label='True Derivative (FD)', alpha=0.4, linewidth=1)
-    ax_b2.plot(t_history, drift_scores_D, 'm-', label='OCP Score $S_{D,k}$', linewidth=2)
-    ax_b2.plot(t_history, drift_quantiles_D, 'k--', label='OCP Quantile $q_{D,k}$', linewidth=1)
-    ax_b2.set_xlabel('Time (s)')
-    ax_b2.set_ylabel('Variation Speed')
-    ax_b2.set_title('Derivative Comparison: OCP Score vs. True Disturbance Change')
-    ax_b2.legend()
-    ax_b2.grid(True)
     fig_bounds.tight_layout()
     fig_bounds.savefig('ocp_bounds_vs_true.png', dpi=150, bbox_inches='tight')
     print("Plot saved to ocp_bounds_vs_true.png")
@@ -553,7 +514,7 @@ def main():
     ax_anim.set_zlabel('Z')
     ax_anim.legend()
     
-    ani = animation.FuncAnimation(fig_anim, update_graph, init_func=init, frames=len(x_history), interval=50, blit=False)
+    ani = animation.FuncAnimation(fig_anim, update_graph, init_func=init, frames=range(0, len(x_history), 5), interval=50, blit=False)
     ani.save('scenario.gif', writer='pillow', fps=20)
     print("Animation saved to scenario.gif")
 
@@ -609,7 +570,7 @@ def main():
     ax_td.set_ylabel('Y')
     ax_td.legend()
     
-    ani_td = animation.FuncAnimation(fig_td, update_graph_td, init_func=init_td, frames=len(x_history), interval=50, blit=False)
+    ani_td = animation.FuncAnimation(fig_td, update_graph_td, init_func=init_td, frames=range(0, len(x_history), 5), interval=50, blit=False)
     ani_td.save('scenario_topdown.gif', writer='pillow', fps=20)
     print("Top-down animation saved to scenario_topdown.gif")
 

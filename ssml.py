@@ -1,8 +1,18 @@
 import os
+# Prevent PyTorch/OpenMP deadlocks on CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+# Ensure single-threaded execution for stability
+torch.set_num_threads(1)
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
@@ -102,7 +112,7 @@ def collect_offline_data():
         # So the DNN target is the FULL true disturbance / m (residual to be learned).
         v = state[3:6]
         angles = state[6:8]
-        d_true = sim.wind_disturbance(t, state[0:3], v=v, angles=angles)
+        d_true = sim.unmodeled_dynamics(t, state[0:3], v, angles)
 
         # input x = [vx, vy, vz, phi, theta]
         x_in = np.concatenate((state[3:6], state[6:8]))
@@ -151,7 +161,6 @@ def train_ssml(data_x, data_y):
 
         # Sample random tasks (trajectory clips)
         num_tasks = 10
-        total_meta_loss = 0
 
         for _ in range(num_tasks):
             # Pick random start for clip
@@ -165,48 +174,52 @@ def train_ssml(data_x, data_y):
             X_t = X_tensor[start_idx + Ha : start_idx + Ha + Ht]
             Y_t = Y_tensor[start_idx + Ha : start_idx + Ha + Ht]
 
-            # 1. Inner Loop: Gradient descent on Ba
-            # Clone model to simulate adaptation
-            fast_weights = [p.clone() for p in model.parameters()]
-
-            pred_a = model.relu(torch.nn.functional.linear(X_a, fast_weights[0], fast_weights[1]))
-            pred_a = model.relu(torch.nn.functional.linear(pred_a, fast_weights[2], fast_weights[3]))
-            pred_a = model.relu(torch.nn.functional.linear(pred_a, fast_weights[4], fast_weights[5]))
-            pred_a = torch.nn.functional.linear(pred_a, fast_weights[6], fast_weights[7])
-
+            # 1. Inner Loop: Gradient descent on Ba (First-Order MAML)
+            # Compute inner loss using current parameters
+            pred_a = model(X_a)
             loss_a = torch.mean((pred_a - Y_a) ** 2)
-            grads = torch.autograd.grad(loss_a, fast_weights, create_graph=True)
-            # Clip inner-loop gradients for stability
-            grads = [torch.clamp(g, -10.0, 10.0) for g in grads]
-            fast_weights = [fw - alpha * g for fw, g in zip(fast_weights, grads)]
+            
+            # Compute inner gradients w.r.t current parameters
+            # Use create_graph=False for FOMAML to avoid engine deadlocks
+            inner_grads = torch.autograd.grad(loss_a, model.parameters(), create_graph=False)
+            
+            # Manually apply update to get fast_weights (detached from inner-gradient graph)
+            fast_weights = [p - alpha * g.detach() for p, g in zip(model.parameters(), inner_grads)]
 
-            # 2. Outer Loop: Prediction on Bt
-            pred_t = model.relu(torch.nn.functional.linear(X_t, fast_weights[0], fast_weights[1]))
-            pred_t = model.relu(torch.nn.functional.linear(pred_t, fast_weights[2], fast_weights[3]))
-            pred_t = model.relu(torch.nn.functional.linear(pred_t, fast_weights[4], fast_weights[5]))
-            pred_t = torch.nn.functional.linear(pred_t, fast_weights[6], fast_weights[7])
+            def inner_forward(x, weights):
+                # Manual forward pass for the 4-layer MLP using fast_weights
+                h1 = torch.nn.functional.relu(torch.nn.functional.linear(x, weights[0], weights[1]))
+                h2 = torch.nn.functional.relu(torch.nn.functional.linear(h1, weights[2], weights[3]))
+                h3 = torch.nn.functional.relu(torch.nn.functional.linear(h2, weights[4], weights[5]))
+                out = torch.nn.functional.linear(h3, weights[6], weights[7])
+                return out
+
+            # 2. Outer Loop: Prediction on Bt using fast_weights
+            pred_t = inner_forward(X_t, fast_weights)
             loss_t_adapt = torch.mean((pred_t - Y_t) ** 2)
 
-            # Direct prediction loss
+            # Direct prediction loss on Bt using current parameters
             pred_t_dir = model(X_t)
             loss_t_dir = torch.mean((pred_t_dir - Y_t) ** 2)
 
-            meta_loss = loss_t_adapt + lambda_dir * loss_t_dir
-            total_meta_loss += meta_loss
+            # Meta-gradient flows through fast_weights back to model.parameters()
+            meta_loss = (loss_t_adapt + lambda_dir * loss_t_dir) / num_tasks
+            meta_loss.backward()
+            epoch_loss += meta_loss.item()
 
-        norm_penalty = sum([torch.norm(p) ** 2 for p in model.parameters()])
-        total_meta_loss = total_meta_loss / num_tasks + lambda_norm * norm_penalty
+        # Apply weight decay equivalent gradients
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad += 2 * lambda_norm * p.data
 
-        total_meta_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Apply layer spectral normalization (approximated by weight clipping)
         spectral_normalization_clip(model)
 
-        epoch_loss += total_meta_loss.item()
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Loss: {epoch_loss}")
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch}/{epochs}, Loss: {epoch_loss:.4f}")
 
     print("Pre-training Complete.")
     torch.save(model.state_dict(), WEIGHTS_PATH)

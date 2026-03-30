@@ -144,9 +144,10 @@ class DynamicTubeMPC:
         self.z_max = 1.2   # Altitude ceiling (m)
         
         self.u_max = 30.0  # Increased for z-axis gravity compensation
-        self.alpha_min = 0.5
-        self.alpha_max = 4.0
+        self.alpha_min = 0.1
+        self.alpha_max = 10.0
         self.Phi = 0.1  # Initial tube size
+        self.use_terminal_vel = True # Toggle terminal velocity constraints
         self._prev_opt = None  # Warm-start: previous solution
         self._z_prev = None    # Ancillary controller: predicted nominal state at next step
 
@@ -161,16 +162,14 @@ class DynamicTubeMPC:
         self.K_vel_xy = 1.5   # x/y-velocity error → pitch/roll rate
 
     def compute_u(self, x: np.ndarray, xd: np.ndarray, 
-                  q_drift: float, model_nn=None):
+                  disturbance_bound: float, model_nn=None):
         import torch
         # Check divergence
         if np.any(np.isnan(x)):
             return np.zeros(3), np.zeros((self.H, 8)), np.zeros(self.H), False
-            
-        disturbance_bound = q_drift / self.T_horizon
-        
+                
         # For point-to-point, we start with a small tube centered on the drone
-        self.Phi = 0.1
+        self.Phi = 0.05
         
         # Evaluate Network Once for Zero-Order Hold Disturbance Prediction over the horizon
         if model_nn is not None and x.shape[0] == 8:
@@ -264,9 +263,10 @@ class DynamicTubeMPC:
 
         # Terminal Velocity Hard Constraints (Equality)
         num_ineq = len(g_sym)
-        g_sym.append(z[3] - xd_ca[3])
-        g_sym.append(z[4] - xd_ca[4])
-        g_sym.append(z[5] - xd_ca[5])
+        if self.use_terminal_vel:
+            g_sym.append(z[3] - xd_ca[3])
+            g_sym.append(z[4] - xd_ca[4])
+            g_sym.append(z[5] - xd_ca[5])
 
         g_ca = ca.vertcat(*g_sym)
 
@@ -282,7 +282,9 @@ class DynamicTubeMPC:
         lbg = [0.0] * g_ca.shape[0]
         # Inequality constraints are (>= 0), so ubg = inf
         # Terminal velocity constraints are (== 0), so ubg = 0
-        ubg = [ca.inf] * num_ineq + [0.0] * 3
+        ubg = [ca.inf] * num_ineq 
+        if self.use_terminal_vel:
+            ubg += [0.0] * 3
 
         # Warm-start
         if self._prev_opt is not None:
