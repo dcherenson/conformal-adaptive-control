@@ -138,15 +138,15 @@ class DynamicTubeMPC:
         self.obstacles = obstacles # List of dicts {'pos': np.array([x,y,z]), 'r': radius}
         self.H = H
         self.dt = dt
-        self.eta = eta
+        self.eta = 0.0
         self.T_horizon = T_horizon
         self.z_min = 0.8   # Altitude floor (m)
         self.z_max = 1.2   # Altitude ceiling (m)
         
         self.u_max = 30.0  # Increased for z-axis gravity compensation
-        self.alpha_min = 0.1
+        self.alpha_min = 0.5
         self.alpha_max = 10.0
-        self.Phi = 0.1  # Initial tube size
+        self.Phi = 0.05  # Initial tube size
         self.use_terminal_vel = True # Toggle terminal velocity constraints
         self._prev_opt = None  # Warm-start: previous solution
         self._z_prev = None    # Ancillary controller: predicted nominal state at next step
@@ -159,7 +159,7 @@ class DynamicTubeMPC:
         self.K_pos_z  = 3.0   # z-position error → thrust
         self.K_vel_z  = 2.0   # z-velocity error → thrust
         self.K_pos_xy = 2.0   # x/y-position error → pitch/roll rate
-        self.K_vel_xy = 1.5   # x/y-velocity error → pitch/roll rate
+        self.K_vel_xy = 3.5   # x/y-velocity error → pitch/roll rate
 
     def compute_u(self, x: np.ndarray, xd: np.ndarray, 
                   disturbance_bound: float, d_hat: np.ndarray = None, model_nn=None):
@@ -242,7 +242,7 @@ class DynamicTubeMPC:
             pos_err = z[:3] - xd_ca[:3]
             vel     = z[3:6]
             cost += 10.0 * ca.dot(pos_err, pos_err)
-            cost +=  5.0 * ca.dot(vel, vel)  # low penalty — terminal cost handles braking
+            cost +=  2.0 * ca.dot(vel, vel)  # low penalty — terminal cost handles braking
             cost +=  1.0 * ca.dot(Vj, Vj)
             cost +=  0.5 * phi**2
 
@@ -259,7 +259,7 @@ class DynamicTubeMPC:
         # Terminal cost
         pos_err_f = z[:3] - xd_ca[:3]
         vel_f     = z[3:6] - xd_ca[3:6]
-        cost += 100.0 * ca.dot(pos_err_f, pos_err_f)
+        cost += 75.0 * ca.dot(pos_err_f, pos_err_f)
         cost +=  50.0 * ca.dot(vel_f, vel_f)
 
         # Terminal Velocity Hard Constraints (Equality)

@@ -22,27 +22,28 @@ def main():
     dt_sim = 0.01
     dt_mpc = 0.05
     n_substeps = int(dt_mpc / dt_sim) # 5
-    t_end = 5.0  # Point-to-point navigation time
+    t_end = 10.0  # Point-to-point navigation time
 
     # Initialize Architecture Components
     sys_plant = Plant(spatial_mode=True)
     
     # Define Obstacles (Large+small pair creating narrow gap, small further along)
     obstacles = [
-        {'pos': np.array([3.0, 0.4, 1.0]), 'r': 0.7},  # Large obstacle, below path
-        {'pos': np.array([3.0,  -0.9, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
-        {'pos': np.array([5.5,  0.0, 1.0]), 'r': 0.4},  # Small obstacle further along path
+        {'pos': np.array([3.0, 0.6, 1.0]), 'r': 0.7},  # Large obstacle, below path
+        {'pos': np.array([1.0, -0.5, 1.0]), 'r': 0.4},  # Large obstacle, below path
+        {'pos': np.array([3.0,  -0.7, 1.0]), 'r': 0.3},  # Small obstacle above path (gap ~0.6m)
+        {'pos': np.array([5.0,  0.4, 1.0]), 'r': 0.4},  # Small obstacle further along path
     ]
-    x_goal = np.array([7.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    goal_radius = 0.3  # Goal region: sphere of this radius around x_goal (m)
+    x_goal = np.array([6.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    goal_radius = 0.5  # Goal region: sphere of this radius around x_goal (m)
 
     # Using DTMPC with full-state feedback and 3D Quadcopter
     mpc_horizon = 10
     sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=mpc_horizon, dt=dt_mpc)
     
     # OCP for Drift bounds
-    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
-    ddot_bound = 1.0
+    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.7)
+    ddot_bound = 4.0
 
     # SSML Network Initialization
     model = get_or_train_model()
@@ -50,11 +51,11 @@ def main():
     theta_flat = flatten_params(model).clone().detach()
     # Adaptation Parameters
 
-    gamma_lr = 0.0
+    gamma_lr = 5.0
     lambd = 0.1
 
     # State variables (8 elements: pos, vel, roll, pitch)
-    x = np.array([-2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # start at offset
+    x = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]) # start at offset
     u = np.array([0.0, 0.0, 9.81 * sys_plant.m])
     u_old = np.copy(u)
 
@@ -120,7 +121,7 @@ def main():
             #     x, xd, dist_bound_ocp, d_hat=d_hat_plotting[-1], model_nn=model
             # )
             u, z_pred, phi_pred, success = sys_controller.compute_u(
-                x, xd, dist_bound_ocp + np.linalg.norm(d_hat_plotting[-1]), model_nn=model
+                x, xd, dist_bound_ocp, model_nn=model
             )
             solve_time = time.time() - t_solve_start
             
@@ -167,7 +168,7 @@ def main():
         v_current = x_dot_pred
 
         # Disturbance Observer Update
-        d_hat = K_obs * x_old - xi
+        d_hat = 0*(K_obs * x_old - xi)
         xi_dot = K_obs * (x_dot_pred + d_hat)
         xi = xi + xi_dot * dt_sim
 
@@ -222,7 +223,7 @@ def main():
             dist_bound = np.sqrt(2.0 * ddot_bound * q_I)
         else:
             dist_bound = np.sqrt(2.0 * ddot_bound * ocp_integral.get_quantile())
-        dist_bound = dist_bound + np.linalg.norm(d_hat_plotting[-1])
+        # dist_bound = dist_bound + np.linalg.norm(d_hat_plotting[-1])
         # Compute Lipschitz constant L_d for plotting
         L_d, _ = compute_ssml_input_lipschitz(model, x_in)
 
@@ -489,6 +490,7 @@ def main():
 
     
     ax_anim.scatter(x_goal[0], x_goal[1], x_goal[2], color='gold', marker='*', s=100)
+    quiver_wind = None
     
     def init():
         line_true.set_data([], [])
@@ -500,6 +502,7 @@ def main():
         return scatter_true, line_true, line_ref, line_pred, scatter_pred
         
     def update_graph(k):
+        nonlocal quiver_wind
         scatter_true._offsets3d = (x_history[k:k+1, 0], x_history[k:k+1, 1], x_history[k:k+1, 2])
         line_true.set_data(x_history[:k+1, 0], x_history[:k+1, 1])
         line_true.set_3d_properties(x_history[:k+1, 2])
@@ -517,6 +520,13 @@ def main():
 
         sys_plant.Phi = tube_history[k] # update for title if needed
         ax_anim.set_title(rf'DTMPC 3D Flight | Time: {t_history[k]:.1f}s | $\Phi$: {tube_history[k]:.2f}m')
+        
+        if quiver_wind is not None:
+            quiver_wind.remove()
+        wind_vec = sys_plant.wind_velocity(t_history[k], x_history[k, :3])
+        quiver_wind = ax_anim.quiver(x_history[k, 0], x_history[k, 1], x_history[k, 2],
+                                     wind_vec[0], wind_vec[1], wind_vec[2], color='purple', length=0.5, normalize=False)
+        
         return scatter_true, line_true, line_ref, line_pred, scatter_pred
 
     # Draw spherical obstacles
@@ -541,9 +551,9 @@ def main():
     ax_anim.set_zlabel('Z')
     ax_anim.legend()
     
-    ani = animation.FuncAnimation(fig_anim, update_graph, init_func=init, frames=range(0, len(x_history), 5), interval=50, blit=False)
-    ani.save('scenario.gif', writer='pillow', fps=20)
-    print("Animation saved to scenario.gif")
+    # ani = animation.FuncAnimation(fig_anim, update_graph, init_func=init, frames=range(0, len(x_history), 5), interval=50, blit=False)
+    # ani.save('scenario.gif', writer='pillow', fps=20)
+    # print("Animation saved to scenario.gif")
 
     # --- Top-Down 2D Animation ---
     print("Generating top-down animation...")
@@ -559,6 +569,7 @@ def main():
     scatter_pred_td = ax_td.scatter([], [], color='cyan', alpha=0.3, label='Tube Envelope')
     
     ax_td.scatter(x_goal[0], x_goal[1], color='gold', marker='*', s=100)
+    quiver_wind_td = None
     
     def init_td():
         line_true_td.set_data([], [])
@@ -568,6 +579,7 @@ def main():
         return scatter_true_td, line_true_td, line_ref_td, line_pred_td, scatter_pred_td
         
     def update_graph_td(k):
+        nonlocal quiver_wind_td
         scatter_true_td.set_offsets(np.column_stack((x_history[k:k+1, 0], x_history[k:k+1, 1])))
         line_true_td.set_data(x_history[:k+1, 0], x_history[:k+1, 1])
         
@@ -581,6 +593,13 @@ def main():
         scatter_pred_td.set_sizes((phi_pred_hist[k] * 100) ** 2)
 
         ax_td.set_title(rf'DTMPC Top-Down Flight | Time: {t_history[k]:.1f}s | $\Phi$: {tube_history[k]:.2f}m')
+        
+        if quiver_wind_td is not None:
+            quiver_wind_td.remove()
+        wind_vec = sys_plant.wind_velocity(t_history[k], x_history[k, :3])
+        quiver_wind_td = ax_td.quiver(x_history[k, 0], x_history[k, 1],
+                                      wind_vec[0], wind_vec[1], color='purple', width=0.005, scale=10)
+
         return scatter_true_td, line_true_td, line_ref_td, line_pred_td, scatter_pred_td
 
     # Draw spherical obstacles (as 2D circles)

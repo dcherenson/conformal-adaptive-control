@@ -33,15 +33,21 @@ class Plant:
         v_wind_z = 1.0 * np.sin(0.3 * t)
         
         if self.spatial_mode:
-            v_wind_x += 0.5 * p[0]
-            v_wind_y += 0.5 * p[1]
+            v_wind_x += 0.5 * (p[0] - 3.0)
+            v_wind_y += 0.5 * (p[1] - 0.5)
             v_wind_z += 0.2 * p[2]
-            
-        return np.array([v_wind_x, v_wind_y, v_wind_z])
+        wind_vec = np.array([v_wind_x, v_wind_y, v_wind_z])
+        
+        goal_pos = np.array([6.0, 0.0, 1.0])
+        dist = np.linalg.norm(p - goal_pos)
+        scale = np.clip(dist / 2.0, 0.0, 1.0)
+        return wind_vec * scale
 
     def unmodeled_dynamics(self, t, p, v, angles):
         """Realistic unmodeled drag using body-frame relative velocity."""
         phi, theta = angles
+        # Additive noise
+        noise = np.random.randn(3) * np.array([0.2, 0.2, 0.1])
         v_wind = self.wind_velocity(t, p)
         v_rel = v - v_wind
         
@@ -61,8 +67,7 @@ class Plant:
         # Drag force in world frame: F = - R * D * (v_b * |v_b|)
         drag_force = -self.m * R @ D_body @ (v_b * np.abs(v_b))
         
-        # Additive noise
-        noise = np.random.randn(3) * np.array([0.2, 0.2, 0.1])
+
         
         return drag_force + noise
 
