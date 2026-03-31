@@ -162,7 +162,7 @@ class DynamicTubeMPC:
         self.K_vel_xy = 1.5   # x/y-velocity error → pitch/roll rate
 
     def compute_u(self, x: np.ndarray, xd: np.ndarray, 
-                  disturbance_bound: float, model_nn=None):
+                  disturbance_bound: float, d_hat: np.ndarray = None, model_nn=None):
         import torch
         # Check divergence
         if np.any(np.isnan(x)):
@@ -231,7 +231,8 @@ class DynamicTubeMPC:
 
             # NN feed-forward (3 acc channels, pad to 8)
             nn_full = ca.vertcat(ca.DM([0, 0, 0]), nn_acc, ca.DM([0, 0]))
-            z_dot = f_z + gV + nn_full
+            d_h = ca.DM(np.zeros(8)) if d_hat is None else ca.DM(d_hat)
+            z_dot = f_z + gV + nn_full + d_h
             z = z + z_dot * self.dt
 
             # Tube dynamics
@@ -359,7 +360,8 @@ class DynamicTubeMPC:
                     gV_[6] = V[j, 0]; gV_[7] = V[j, 1]
                     f_ = self.plant.f(z_)
                     nn_ = np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
-                    z_ = z_ + (f_ + gV_ + nn_) * self.dt
+                    d_h_np = np.zeros(8) if d_hat is None else d_hat
+                    z_ = z_ + (f_ + gV_ + nn_ + d_h_np) * self.dt
                     phi_ = phi_ + self.dt * (-al[j] * phi_ + disturbance_bound + self.eta)
                 return np.array(cons)
 
@@ -404,7 +406,8 @@ class DynamicTubeMPC:
         z   = np.copy(x)
         phi = self.Phi
         for j in range(self.H):
-            z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V_opt[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
+            d_h_np = np.zeros(8) if d_hat is None else d_hat
+            z_dot = self.plant.f(z) + self.plant.g_mat(z) @ V_opt[j] + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)]) + d_h_np
             z   = z   + z_dot * self.dt
             phi = phi + self.dt * (-alphas_opt[j] * phi + disturbance_bound + self.eta)
             z_pred.append(np.copy(z))

@@ -22,7 +22,7 @@ def main():
     dt_sim = 0.01
     dt_mpc = 0.05
     n_substeps = int(dt_mpc / dt_sim) # 5
-    t_end = 10.0  # Point-to-point navigation time
+    t_end = 5.0  # Point-to-point navigation time
 
     # Initialize Architecture Components
     sys_plant = Plant(spatial_mode=True)
@@ -42,7 +42,7 @@ def main():
     
     # OCP for Drift bounds
     ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.1)
-    ddot_bound = 3.0
+    ddot_bound = 1.0
 
     # SSML Network Initialization
     model = get_or_train_model()
@@ -50,7 +50,7 @@ def main():
     theta_flat = flatten_params(model).clone().detach()
     # Adaptation Parameters
 
-    gamma_lr = 0.5
+    gamma_lr = 0.0
     lambd = 0.1
 
     # State variables (8 elements: pos, vel, roll, pitch)
@@ -87,6 +87,7 @@ def main():
     tube_plotting = [sys_controller.Phi]
     theta_plotting = [theta_flat.detach().numpy().copy()]
     residual_plotting = [0.0]  # Initial residual is 0.0 before evaluating data
+    d_error_plotting = [0.0]
 
     # Coverage Tracking
     correct_bounds_count = 0
@@ -96,6 +97,12 @@ def main():
     print("Running SSML DTMPC 3D Flight Simulation...")
     mpc_step_counter = 0
     theta_dot_norm_val = 0.0 # Initial adaptation rate
+
+    # Disturbance Observer Initialization
+    K_obs = 5.0
+    xi = K_obs * np.copy(x)
+    d_hat = 0*np.ones(8)
+    d_hat_plotting = [np.copy(d_hat)]
 
     # Simulation Loop
     xd = x_goal
@@ -108,7 +115,13 @@ def main():
             # Controller computes 3D control force and prediction horizon
             u_old_mpc = np.copy(u) # store for possible reference
             t_solve_start = time.time()
-            u, z_pred, phi_pred, success = sys_controller.compute_u(x, xd, dist_bound_plotting[-1], model_nn=model)
+            dist_bound_ocp = np.sqrt(2.0 * ddot_bound * drift_quantiles_I[-1])
+            # u, z_pred, phi_pred, success = sys_controller.compute_u(
+            #     x, xd, dist_bound_ocp, d_hat=d_hat_plotting[-1], model_nn=model
+            # )
+            u, z_pred, phi_pred, success = sys_controller.compute_u(
+                x, xd, dist_bound_ocp + np.linalg.norm(d_hat_plotting[-1]), model_nn=model
+            )
             solve_time = time.time() - t_solve_start
             
             if mpc_step_counter % 10 == 0:
@@ -153,9 +166,14 @@ def main():
         # Compute predicted full-state derivative v_current = x_dot_pred
         v_current = x_dot_pred
 
+        # Disturbance Observer Update
+        d_hat = K_obs * x_old - xi
+        xi_dot = K_obs * (x_dot_pred + d_hat)
+        xi = xi + xi_dot * dt_sim
+
         # Update Rolling Windows
         past_states.append(np.copy(x_old))
-        past_f_nom.append(np.copy(x_dot_pred))
+        past_f_nom.append(np.copy(x_dot_pred + d_hat))
         past_v.append(np.copy(v_current))
         past_theta_dot_norm.append(theta_dot_norm_val)
 
@@ -204,7 +222,7 @@ def main():
             dist_bound = np.sqrt(2.0 * ddot_bound * q_I)
         else:
             dist_bound = np.sqrt(2.0 * ddot_bound * ocp_integral.get_quantile())
-
+        dist_bound = dist_bound + np.linalg.norm(d_hat_plotting[-1])
         # Compute Lipschitz constant L_d for plotting
         L_d, _ = compute_ssml_input_lipschitz(model, x_in)
 
@@ -235,6 +253,7 @@ def main():
         t += dt_sim
         # u_old = np.copy(u) # already handled at loop top if needed
         x_plotting.append(np.copy(x))
+        d_hat_plotting.append(np.copy(d_hat))
         t_plotting.append(t)
         drift_scores_I.append(S_I)
         drift_quantiles_I.append(ocp_integral.get_quantile())
@@ -242,6 +261,7 @@ def main():
         tube_plotting.append(sys_controller.Phi)
         theta_plotting.append(theta_flat.detach().numpy().copy())
         residual_plotting.append(np.linalg.norm(error_acc_true))
+        d_error_plotting.append(np.linalg.norm(error_acc_true - d_hat[3:6]))
         Ld_plotting.append(L_d)
 
         # Collision check
@@ -265,6 +285,7 @@ def main():
 
     # Convert lists to arrays for editing plots
     x_history = np.array(x_plotting)
+    d_hat_history = np.array(d_hat_plotting)
     t_history = np.array(t_plotting)
     xd_history = np.array(xd_plotting)
     z_pred_hist = np.array(z_pred_plotting)
@@ -340,9 +361,15 @@ def main():
 
     # --- Unified OCP Bounds & Residuals Plot ---
     residual_history = np.array(residual_plotting)
+    d_error_history = np.array(d_error_plotting)
     fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 5))
     ax_b1.plot(t_history, residual_history, 'r-', label=r'Instantaneous Residual $\|\tilde F + \delta\|$', alpha=0.6)
-    ax_b1.plot(t_history, dist_bound_history, 'k--', label=r'OCP Disturbance Bound $E_k$', linewidth=2)
+    d_hat_norm = np.linalg.norm(d_hat_history[:, 3:6], axis=1)
+    ax_b1.plot(t_history, d_hat_norm, 'g-.', label=r'Disturbance Observer Estimate $\|\hat{d}\|$', alpha=0.8)
+    ax_b1.plot(t_history, d_error_history, 'm-', label=r'True Error $\|d_{true} - \hat{d}\|$', alpha=0.9, linewidth=1.5)
+    ocp_pure_bound = np.sqrt(2.0 * ddot_bound * drift_quantiles_I)
+    ax_b1.plot(t_history, ocp_pure_bound, 'c--', label=r'Isolated OCP $E_k$ Bound', linewidth=2)
+    ax_b1.plot(t_history, dist_bound_history, 'k--', label=r'Total Disturbance Bound', linewidth=2)
     ax_b1.set_xlabel('Time (s)')
     ax_b1.set_ylabel('Dynamics Mismatch (m/s^2)')
     ax_b1.set_title('Unified OCP Bounds and Dynamics Residuals')
