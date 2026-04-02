@@ -16,7 +16,7 @@ plt.rcParams.update({
 
 # Architecture Modules
 from plant import Plant
-from ocp import DriftScoreOCP
+from ocp import DriftScoreOCP, InterleavedDriftScoreOCP
 from controller import DynamicTubeMPC
 
 # SSML Modules
@@ -28,7 +28,7 @@ def main():
 
     # Simulation Variables
     t = 0.0
-    dt_sim = 0.01
+    dt_sim = 0.05
     dt_mpc = 0.05
     n_substeps = int(dt_mpc / dt_sim) # 5
     t_end = 10.0  # Point-to-point navigation time
@@ -50,8 +50,9 @@ def main():
     mpc_horizon = 10
     sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=mpc_horizon, dt=dt_mpc)
     # OCP for Drift bounds
-    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.05, q_init=0.7)
-    ddot_bound = 3.0
+    T_window = int(mpc_horizon * dt_mpc / dt_sim) # 50 steps at 100 Hz
+    ocp_integral = InterleavedDriftScoreOCP(alpha=0.1, eta_const=0.5, N_threads=T_window, q_init=0.5)
+    ddot_bound = 2.0
 
     # SSML Network Initialization
     model = get_or_train_model()
@@ -79,7 +80,6 @@ def main():
     
     # Rolling Windows (Maintain same physical time window as before: 0.5s)
     import collections
-    T_window = int(mpc_horizon * dt_mpc / dt_sim) # 50 steps at 100 Hz
     past_states = collections.deque(maxlen=T_window)
     past_f_nom = collections.deque(maxlen=T_window)
     past_v = collections.deque(maxlen=T_window)
@@ -394,12 +394,12 @@ def main():
     print("Plot saved to vel_norm_vs_time.png")
     # --- Unified OCP Bounds & Residuals Plot ---
     d_error_history = np.array(d_error_plotting)
-    ocp_pure_bound = compute_dist_bound(drift_quantiles_I, ddot_bound, T_p)
+    # ocp_pure_bound = compute_dist_bound(drift_quantiles_I, ddot_bound, T_p)
     indices = np.arange(len(t_history))
     
     fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 5))
-    ax_b1.fill_between(indices, 0, ocp_pure_bound, color='#aae0fa', alpha=0.8, label=r'OCP Prediction Bound')
-    ax_b1.plot(indices, ocp_pure_bound, 'k-', linewidth=1.5)
+    ax_b1.fill_between(indices, 0, dist_bound_history, color='#aae0fa', alpha=0.8, label=r'OCP Prediction Bound')
+    ax_b1.plot(indices, dist_bound_history, 'k-', linewidth=1.5)
     ax_b1.plot(indices, d_error_history, color='#D95319', label=r'True $d(t)$', linewidth=1.5)
     
     ax_b1.set_xlim(0, int(t_end / dt_sim))

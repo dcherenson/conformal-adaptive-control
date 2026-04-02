@@ -64,3 +64,41 @@ class DriftScoreOCP(OCPBase):
         else:
             d_bar = (q_k / T) + 0.5 * L_d * T
         return d_bar
+
+class InterleavedDriftScoreOCP(OCPBase):
+    def __init__(self, alpha: float, eta_const: float, N_threads: int, q_init: float = 0.0):
+        super().__init__(alpha, eta_const, q_init)
+        self.N = N_threads
+        self.qs = np.full(self.N, max(0.0, q_init))
+        self.k_step = 0
+        
+    def update(self, S_k: float) -> float:
+        """
+        Updates the estimated quantile q_k using online gradient descent on the pinball loss.
+        The thread active for prediction is j = k % N, avoiding delayed feedback overlap.
+        """
+        j = self.k_step % self.N
+        eta_k = self.eta_const
+        
+        # indicator is 1 if realized error > threshold
+        indicator = 1.0 if S_k > self.qs[j] else 0.0
+        
+        self.qs[j] = max(0.0, self.qs[j] + eta_k * (indicator - self.alpha))
+        q_out = self.qs[j]
+        
+        self.k_step += 1
+        return q_out
+        
+    def get_quantile(self) -> float:
+        j = self.k_step % self.N
+        return self.qs[j]
+        # return np.max(self.qs)
+
+    def get_dist_bound_from_quantile(self, q_k: float, T: float, L_d: float) -> float:
+        d_triangle = np.sqrt(2.0 * L_d * q_k)
+        triangle_base = 2.0 * d_triangle / L_d
+        if triangle_base <= T:
+            d_bar = d_triangle
+        else:
+            d_bar = (q_k / T) + 0.5 * L_d * T
+        return d_bar
