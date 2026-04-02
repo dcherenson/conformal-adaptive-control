@@ -213,3 +213,5 @@ __marimo__/
 *.pdf
 *.pt
 *.txt
+*.svg
+*.tex

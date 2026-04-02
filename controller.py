@@ -133,13 +133,12 @@ class DynamicTubeMPC:
     and control bandwidth (alpha) as decision variables. Supports 3D Space and SSML DNN.
     """
     def __init__(self, plant, obstacles: list, H: int = 5,
-                 dt: float = 0.1, eta: float = 0.1, T_horizon: float = 1.0):
+                 dt: float = 0.1, eta: float = 0.1):
         self.plant = plant
         self.obstacles = obstacles # List of dicts {'pos': np.array([x,y,z]), 'r': radius}
         self.H = H
         self.dt = dt
         self.eta = 0.0
-        self.T_horizon = T_horizon
         self.z_min = 0.8   # Altitude floor (m)
         self.z_max = 1.2   # Altitude ceiling (m)
         

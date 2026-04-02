@@ -4,6 +4,15 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import time
 plt.switch_backend('Agg')
+plt.rcParams.update({
+    'font.size': 14,
+    'axes.titlesize': 18,
+    'axes.labelsize': 16,
+    'xtick.labelsize': 14,
+    'ytick.labelsize': 14,
+    'legend.fontsize': 14,
+    'figure.titlesize': 20
+})
 
 # Architecture Modules
 from plant import Plant
@@ -40,10 +49,9 @@ def main():
     # Using DTMPC with full-state feedback and 3D Quadcopter
     mpc_horizon = 10
     sys_controller = DynamicTubeMPC(plant=sys_plant, obstacles=obstacles, H=mpc_horizon, dt=dt_mpc)
-    
     # OCP for Drift bounds
-    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.1, q_init=0.7)
-    ddot_bound = 4.0
+    ocp_integral = DriftScoreOCP(alpha=0.1, eta_const=0.05, q_init=0.7)
+    ddot_bound = 3.0
 
     # SSML Network Initialization
     model = get_or_train_model()
@@ -51,7 +59,7 @@ def main():
     theta_flat = flatten_params(model).clone().detach()
     # Adaptation Parameters
 
-    gamma_lr = 5.0
+    gamma_lr = 0.0
     lambd = 0.1
 
     # State variables (8 elements: pos, vel, roll, pitch)
@@ -108,6 +116,17 @@ def main():
     # Simulation Loop
     xd = x_goal
     t_sim_block_start = time.time()
+
+    # Helper for interval-constrained OCP bound
+    T_p = T_window * dt_sim
+    def compute_dist_bound(q_k, L_d, T_p):
+        thresh = 0.5 * L_d * (T_p ** 2)
+        T_safe = max(T_p, 1e-8)
+        return np.where(q_k < thresh,
+                        q_k / T_safe + 0.5 * L_d * T_p,
+                        np.sqrt(2.0 * L_d * q_k))
+        # return np.sqrt(2.0*L_d*q_k)
+
     while t <= t_end:
         t_start = time.time()
         # 1. Update MPC at 20 Hz
@@ -116,7 +135,7 @@ def main():
             # Controller computes 3D control force and prediction horizon
             u_old_mpc = np.copy(u) # store for possible reference
             t_solve_start = time.time()
-            dist_bound_ocp = np.sqrt(2.0 * ddot_bound * drift_quantiles_I[-1])
+            dist_bound_ocp = float(compute_dist_bound(drift_quantiles_I[-1], ddot_bound, T_p))
             # u, z_pred, phi_pred, success = sys_controller.compute_u(
             #     x, xd, dist_bound_ocp, d_hat=d_hat_plotting[-1], model_nn=model
             # )
@@ -220,9 +239,9 @@ def main():
             
             # Update the Integral Quantile
             q_I = ocp_integral.update(S_I)
-            dist_bound = np.sqrt(2.0 * ddot_bound * q_I)
+            dist_bound = float(compute_dist_bound(q_I, ddot_bound, T_p))
         else:
-            dist_bound = np.sqrt(2.0 * ddot_bound * ocp_integral.get_quantile())
+            dist_bound = float(compute_dist_bound(ocp_integral.get_quantile(), ddot_bound, T_p))
         # dist_bound = dist_bound + np.linalg.norm(d_hat_plotting[-1])
         # Compute Lipschitz constant L_d for plotting
         L_d, _ = compute_ssml_input_lipschitz(model, x_in)
@@ -360,24 +379,39 @@ def main():
     fig_pos.savefig('pos_vs_time.png', dpi=150, bbox_inches='tight')
     print("Plot saved to pos_vs_time.png")
 
+    # --- Velocity Norm Plot ---
+    fig_vel, ax_vel = plt.subplots(1, 1, figsize=(8, 4))
+    v_norm = np.linalg.norm(x_history[:, 3:6], axis=1)
+    ax_vel.plot(t_history, v_norm, 'b-', linewidth=2, label='Velocity Norm')
+    ax_vel.set_xlabel('Time (s)')
+    ax_vel.set_ylabel('Velocity (m/s)')
+    ax_vel.set_title('Velocity Norm vs. Time')
+    ax_vel.set_xlim([0, t_end])
+    ax_vel.legend()
+    ax_vel.grid(True)
+    fig_vel.tight_layout()
+    fig_vel.savefig('vel_norm_vs_time.png', dpi=150, bbox_inches='tight')
+    print("Plot saved to vel_norm_vs_time.png")
     # --- Unified OCP Bounds & Residuals Plot ---
-    residual_history = np.array(residual_plotting)
     d_error_history = np.array(d_error_plotting)
+    ocp_pure_bound = compute_dist_bound(drift_quantiles_I, ddot_bound, T_p)
+    indices = np.arange(len(t_history))
+    
     fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 5))
-    ax_b1.plot(t_history, residual_history, 'r-', label=r'Instantaneous Residual $\|\tilde F + \delta\|$', alpha=0.6)
-    d_hat_norm = np.linalg.norm(d_hat_history[:, 3:6], axis=1)
-    ax_b1.plot(t_history, d_hat_norm, 'g-.', label=r'Disturbance Observer Estimate $\|\hat{d}\|$', alpha=0.8)
-    ax_b1.plot(t_history, d_error_history, 'm-', label=r'True Error $\|d_{true} - \hat{d}\|$', alpha=0.9, linewidth=1.5)
-    ocp_pure_bound = np.sqrt(2.0 * ddot_bound * drift_quantiles_I)
-    ax_b1.plot(t_history, ocp_pure_bound, 'c--', label=r'Isolated OCP $E_k$ Bound', linewidth=2)
-    ax_b1.plot(t_history, dist_bound_history, 'k--', label=r'Total Disturbance Bound', linewidth=2)
-    ax_b1.set_xlabel('Time (s)')
-    ax_b1.set_ylabel('Dynamics Mismatch (m/s^2)')
-    ax_b1.set_title('Unified OCP Bounds and Dynamics Residuals')
-    ax_b1.legend()
-    ax_b1.grid(True)
+    ax_b1.fill_between(indices, 0, ocp_pure_bound, color='#aae0fa', alpha=0.8, label=r'OCP Prediction Bound')
+    ax_b1.plot(indices, ocp_pure_bound, 'k-', linewidth=1.5)
+    ax_b1.plot(indices, d_error_history, color='#D95319', label=r'True $d(t)$', linewidth=1.5)
+    
+    ax_b1.set_xlim(0, int(t_end / dt_sim))
+    ax_b1.set_ylim(bottom=0)
+    ax_b1.set_xlabel('Time (x 0.01 s)')
+    ax_b1.set_ylabel(r'$\Vert d \Vert$')
+    # ax_b1.set_title('OCP Bounds vs. True Error')
+    ax_b1.legend(loc='upper right')
+    ax_b1.grid(True, linestyle=':', alpha=0.7)
     fig_bounds.tight_layout()
     fig_bounds.savefig('ocp_bounds_vs_true.png', dpi=150, bbox_inches='tight')
+    fig_bounds.savefig('ocp_bounds_vs_true.svg', dpi=150, bbox_inches='tight')
     print("Plot saved to ocp_bounds_vs_true.png")
     
     # --- Tube Size Plot ---
@@ -387,6 +421,7 @@ def main():
     ax_tube.set_xlabel('Time (s)')
     ax_tube.set_ylabel(r'Boundary $\Phi$ (m)')
     ax_tube.set_title('Dynamic Tube Size Over Time')
+    ax_tube.set_xlim([0, t_end])
     ax_tube.legend()
     ax_tube.grid(True)
     fig_tube.tight_layout()
@@ -401,6 +436,7 @@ def main():
     ax_theta.set_xlabel('Time (s)')
     ax_theta.set_ylabel(r'NN Weight Values $\theta$')
     ax_theta.set_title('Neural Network Parameters Evolution')
+    ax_theta.set_xlim([0, t_end])
     ax_theta.grid(True)
     fig_theta.tight_layout()
     fig_theta.savefig('nn_params_vs_time.png', dpi=150, bbox_inches='tight')
@@ -412,6 +448,7 @@ def main():
     ax_norm.set_xlabel('Time (s)')
     ax_norm.set_ylabel('Parameter Deviation')
     ax_norm.set_title('Neural Network Parameter Adaptation Progress')
+    ax_norm.set_xlim([0, t_end])
     ax_norm.legend()
     ax_norm.grid(True)
     fig_norm.savefig('nn_param_deviation.png', dpi=150, bbox_inches='tight')
@@ -430,20 +467,97 @@ def main():
         obs_circle = plt.Circle((obs['pos'][0], obs['pos'][1]), obs['r'], color='r', alpha=0.2)
         ax_top.add_patch(obs_circle)
     ax_top.scatter(x_goal[0], x_goal[1], color='gold', marker='*', s=150, label='Goal')
+    goal_circle = plt.Circle((x_goal[0], x_goal[1]), goal_radius, color='g', alpha=0.2, label='Goal Region')
+    ax_top.add_patch(goal_circle)
 
-    # Plot Tube Boundary (Downsampled)
-    for i in range(0, len(t_history), 5):  # Every 5 steps
-        circ = plt.Circle((x_history[i, 0], x_history[i, 1]), tube_history[i], color='b', fill=False, alpha=0.2)
-        ax_top.add_patch(circ)
+    def draw_continuous_tube(ax, path_xy, R, color='c', alpha=0.2):
+        from matplotlib.patches import Polygon
+        radii = np.full(len(path_xy), R) if np.isscalar(R) else np.asarray(R)
         
+        if len(path_xy) < 2:
+            return
+            
+        N = len(path_xy)
+        tangents = np.zeros_like(path_xy)
+        
+        # Central difference for internal points
+        for i in range(1, N - 1):
+            t = path_xy[i+1] - path_xy[i-1]
+            nrm = np.linalg.norm(t) + 1e-8
+            tangents[i] = t / nrm
+            
+        # Forward/backward difference for edges
+        t0 = path_xy[1] - path_xy[0]
+        tangents[0] = t0 / (np.linalg.norm(t0) + 1e-8)
+        
+        tn = path_xy[N-1] - path_xy[N-2]
+        tangents[-1] = tn / (np.linalg.norm(tn) + 1e-8)
+        
+        # Normals (rotate 90 degrees CCW)
+        normals = np.empty_like(tangents)
+        normals[:, 0] = -tangents[:, 1]
+        normals[:, 1] = tangents[:, 0]
+        
+        # Left and Right points
+        left_pts = path_xy + normals * radii[:, np.newaxis]
+        right_pts = path_xy - normals * radii[:, np.newaxis]
+        
+        # Semicircle at the end of the tube (i = N-1)
+        theta_t = np.arctan2(tangents[-1, 1], tangents[-1, 0])
+        # Sweep from +pi/2 (left normal) to -pi/2 (right normal) relative to tangent
+        angles = np.linspace(theta_t + np.pi/2, theta_t - np.pi/2, 15)
+        
+        center = path_xy[-1]
+        r_end = radii[-1]
+        semicircle_pts = np.vstack([
+            center[0] + r_end * np.cos(angles),
+            center[1] + r_end * np.sin(angles)
+        ]).T
+        
+        # Combine into continuous closed polygon
+        # left_pts[:-1] prevents duplicating the point at left_pts[-1] == semicircle_pts[0]
+        # semicircle_pts[-1] == right_pts[-1], so right_pts[-2::-1] skips right_pts[-1].
+        poly_pts = np.vstack((left_pts[:-1], semicircle_pts, right_pts[-2::-1]))
+        
+        poly = Polygon(poly_pts, closed=True, facecolor=color, edgecolor=color, alpha=alpha, zorder=2)
+        ax.add_patch(poly)
+
+    # Plot predicted Tube Boundary and Wind Quivers every 0.75 seconds
+    step_0_5 = int(0.75 / dt_sim)
+    plot_indices = list(range(0, len(t_history), step_0_5))
+
+    for i in plot_indices:
+        # Predicted tube continuous polygon over the horizon
+        z_pred = z_pred_hist[i]
+        phi_pred = phi_pred_hist[i]
+        draw_continuous_tube(ax_top, z_pred[:, :2], phi_pred, color='c', alpha=0.2)
+            
+        # Plot Wind Direction
+        wind_vec = sys_plant.wind_velocity(t_history[i], x_history[i, :3])/3
+        if np.linalg.norm(wind_vec[:2]) > 1e-3:
+            # We don't add label to quiver to avoid legend duplication
+            ax_top.quiver(x_history[i, 0], x_history[i, 1], wind_vec[0], wind_vec[1],
+                          color='purple', width=0.005, scale=15, alpha=0.7, zorder=5)
+
     ax_top.set_xlabel('X Position (m)')
     ax_top.set_ylabel('Y Position (m)')
-    ax_top.set_title('Top-Down View: Trajectory and Dynamic Tube Corridor')
-    ax_top.legend()
+    # ax_top.set_title('Top-Down View: Trajectory and Dynamic Tube Corridor')
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Line2D([0], [0], color='b', lw=2, label='Trajectory'),
+        Patch(facecolor='c', edgecolor='none', alpha=0.2, label='Predicted Tube'),
+        Patch(facecolor='r', edgecolor='none', alpha=0.2, label='Obstacle'),
+        Patch(facecolor='g', edgecolor='none', alpha=0.2, label='Goal Region'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='gold', markersize=15, label='Goal'),
+        Line2D([0], [0], color='purple', marker=r'$\rightarrow$', markersize=15, linestyle='None', label='Wind Vector')
+    ]
+    ax_top.legend(handles=legend_elements, loc='upper right')
     ax_top.grid(True)
     ax_top.set_aspect('equal')
     fig_top.tight_layout()
     fig_top.savefig('top_down_tube.png', dpi=150, bbox_inches='tight')
+    fig_top.savefig('top_down_tube.svg', dpi=150, bbox_inches='tight')
     print("Plot saved to top_down_tube.png")
 
     # --- Lipschitz Constant Plot ---
@@ -453,6 +567,7 @@ def main():
     ax_ld.set_xlabel('Time (s)')
     ax_ld.set_ylabel('Lipschitz Constant')
     ax_ld.set_title('Dynamics Discrepancy Lipschitz Constant Evolution')
+    ax_ld.set_xlim([0, t_end])
     ax_ld.legend()
     ax_ld.grid(True)
     fig_ld.tight_layout()

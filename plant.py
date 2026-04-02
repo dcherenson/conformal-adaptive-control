@@ -34,7 +34,7 @@ class Plant:
         
         if self.spatial_mode:
             v_wind_x += 0.5 * (p[0] - 3.0)
-            v_wind_y += 0.5 * (p[1] - 0.5)
+            v_wind_y += 0.5 * np.clip(p[1] - 0.5, -1.0, 1.0)
             v_wind_z += 0.2 * p[2]
         wind_vec = np.array([v_wind_x, v_wind_y, v_wind_z])
         
